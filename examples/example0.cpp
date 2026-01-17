@@ -82,7 +82,7 @@ int main( int argc, char *argv[] )
   MOV R1, #5          ; Move immediate 5 to R1
   ADD R0, R1, #1      ; Add R1 + 1, store in R0
   LDR R2, =2.71828    ; Load literal from pool into R2
-  LDR R0, =0.    ; Load literal from pool into R0
+  LDR R0, =0.         ; Load literal from pool into R0
   STR R2, [#3]        ; Store R2 to arena at offset 3
   MUL R0, R1, R2      ; Multiply R1 * R2, store in R0
   END

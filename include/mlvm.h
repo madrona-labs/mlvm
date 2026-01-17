@@ -78,6 +78,9 @@ enum registerAddressModes {
 };
 
 // NOTE how to encode immediates? 2^n with an offset, or possibly even a table of 128 useful values.
+
+// SILLY - JUST MAKE ROOM FOR FLOAT32
+
 // table idea: 0, [1/64 -- 1/2], [1 -- 64]
 inline float getImmediate(Operand op) { return float(getIndex(op)); }
 
