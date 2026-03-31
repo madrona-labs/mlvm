@@ -129,8 +129,8 @@ struct Program {
 };
 
 struct MLVM {
-  std::vector< DSPVector > registers;
-  std::vector< DSPVector > arena;
+  std::vector< SignalBlock > registers;
+  std::vector< SignalBlock > arena;
   Program program;
   uint32_t programCounter;
   
@@ -153,9 +153,9 @@ struct MLVM {
   void process(AudioContext* context);
   
 private:
-  DSPVector getValue(Operand op1);
-  DSPVector getValue2(Operand op1, Operand op2, const std::vector< float >& literals);
-  DSPVector* getDest2(Operand op1, Operand op2);
+  SignalBlock getValue(Operand op1);
+  SignalBlock getValue2(Operand op1, Operand op2, const std::vector< float >& literals);
+  SignalBlock* getDest2(Operand op1, Operand op2);
 
 };
 

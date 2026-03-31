@@ -19,10 +19,9 @@ constexpr float kOutputGain = 0.1f;
 
 struct VMExampleState {
   MLVM* vm{nullptr};
-  EventsToSignals* eventsToSignals{nullptr};
 };
 
-// processAudio() does all of the audio processing, in DSPVector-sized chunks.
+// processAudio() does all of the audio processing, in SignalBlock-sized chunks.
 // It is called every time a new buffer of audio is needed.
 void processAudio(AudioContext* ctx, void *state)
 {
@@ -32,10 +31,7 @@ void processAudio(AudioContext* ctx, void *state)
   auto procState = static_cast<VMExampleState*>(state);
   
   MLVM* vm = procState->vm;
-  EventsToSignals* evToSigs = procState->eventsToSignals;
 
-  int startOffset(0);
-  evToSigs->processVector(startOffset);
   
   // run vm
   vm->process(ctx);
@@ -81,7 +77,7 @@ int main( int argc, char *argv[] )
   std::string testCode = R"(
   MOV R1, #5          ; Move immediate 5 to R1
   ADD R0, R1, #1      ; Add R1 + 1, store in R0
-  LDR R2, =2.71828    ; Load literal from pool into R2
+  LDR R2, =3.0   ; Load literal from pool into R2
   LDR R0, =0.         ; Load literal from pool into R0
   STR R2, [#3]        ; Store R2 to arena at offset 3
   MUL R0, R1, R2      ; Multiply R1 * R2, store in R0
@@ -96,7 +92,7 @@ int main( int argc, char *argv[] )
   vm.setProgram(testProgram);
 
   // fill a struct with the data the callback will need to create a context.
-  VMExampleState state{&vm, &eventsToSignals};
+  VMExampleState state{&vm};
   
   AudioContext ctx(kInputChannels, kOutputChannels, kSampleRate);
   AudioTask exampleTask(&ctx, processAudio, &state);

@@ -19,9 +19,9 @@ void MLVM::setProgram(const Program& newCode) {
 }
 
 // get the value from the operand, handling the register addressing modes.
-DSPVector MLVM::getValue(Operand op)
+SignalBlock MLVM::getValue(Operand op)
 {
-  DSPVector result;
+  SignalBlock result;
   switch(getOperandMode(op))
   {
     case REGISTER:
@@ -29,16 +29,16 @@ DSPVector MLVM::getValue(Operand op)
       break;
     case IMMEDIATE:
       // fill vector with float immediate
-      result = DSPVector(getImmediate(op));
+      result = SignalBlock(getImmediate(op));
       break;
   }
   return result;
 }
 
 // get the value from the two operands, handling the memory addressing modes.
-DSPVector MLVM::getValue2(Operand op1, Operand op2, const std::vector< float >& literals)
+SignalBlock MLVM::getValue2(Operand op1, Operand op2, const std::vector< float >& literals)
 {
-  DSPVector result;
+  SignalBlock result;
   size_t offset = (getIndex(op1) << 7) | getIndex(op2);
   switch(getOperandMode(op1))
   {
@@ -47,16 +47,16 @@ DSPVector MLVM::getValue2(Operand op1, Operand op2, const std::vector< float >& 
       break;
     case LITERAL:
       // fill vector with float literal
-      result = DSPVector(literals[offset]);
+      result = SignalBlock(literals[offset]);
       break;
   }
   return result;
 }
 
 // get destination from the two operands, handling the memory addressing modes.
-DSPVector* MLVM::getDest2(Operand op1, Operand op2)
+SignalBlock* MLVM::getDest2(Operand op1, Operand op2)
 {
-  DSPVector* result{nullptr};
+  SignalBlock* result{nullptr};
   size_t offset = (getIndex(op1) << 7) | getIndex(op2);
   switch(getOperandMode(op1))
   {
@@ -73,7 +73,7 @@ DSPVector* MLVM::getDest2(Operand op1, Operand op2)
 
 void MLVM::process(AudioContext* context) {
   size_t destIdx, srcIdx1, srcIdx2;
-  DSPVector v1, v2;
+  SignalBlock v1, v2;
   
   // main inputs / outputs are dynamic, so check them
   if (context->outputs.size() < 1) return;
@@ -132,7 +132,7 @@ void MLVM::process(AudioContext* context) {
   static int testCounter{0};
   const int nSamples = context->getSampleRate();
   auto timeInfo = context->getTimeInfo();
-  testCounter += kFloatsPerDSPVector;
+  testCounter += kFramesPerBlock;
   if (testCounter >= nSamples) {
     testCounter -= nSamples;
     std::cout << "bpm:" << timeInfo.bpm << "\n";
