@@ -23,16 +23,10 @@ struct VMExampleState {
 
 // processAudio() does all of the audio processing, in SignalBlock-sized chunks.
 // It is called every time a new buffer of audio is needed.
-void processAudio(AudioContext* ctx, void *state)
+void processAudio(AudioContext* ctx, VMExampleState* state)
 {
-  // at the beginning of the main process function we need to cast the void* to
-  // the type of our state. Making AudioTask a template would have been an alternative
-  // to this but would have added a lot of template code behind the scenes.
-  auto procState = static_cast<VMExampleState*>(state);
-  
-  MLVM* vm = procState->vm;
+  MLVM* vm = state->vm;
 
-  
   // run vm
   vm->process(ctx);
 }
@@ -55,7 +49,6 @@ int main( int argc, char *argv[] )
   MIDIInput midiInput;
   if (!midiInput.start(handleMsg)) {
     std::cout << "couldn't start MIDI input!\n";
-    return 0;
   }
 
   // start the Timers. call this once in an application.
@@ -81,6 +74,7 @@ int main( int argc, char *argv[] )
   LDR R0, =0.         ; Load literal from pool into R0
   STR R2, [#3]        ; Store R2 to arena at offset 3
   MUL R0, R1, R2      ; Multiply R1 * R2, store in R0
+  MUL R0, R0, #0      ; Mul r0 * 0 : don't make sound 
   END
   )";
 
@@ -94,7 +88,7 @@ int main( int argc, char *argv[] )
   // fill a struct with the data the callback will need to create a context.
   VMExampleState state{&vm};
   
-  AudioContext ctx(kInputChannels, kOutputChannels, kSampleRate);
+  AudioContext ctx(kInputChannels, kOutputChannels);
   AudioTask exampleTask(&ctx, processAudio, &state);
   
   // roll onward at 120 bpm
