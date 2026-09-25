@@ -31,6 +31,32 @@ void processAudio(AudioContext* ctx, VMExampleState* state)
   vm->process(ctx);
 }
 
+struct ContextLogger
+{
+  ContextLogger(AudioTask* t, AudioContext* c)
+  {
+    task = t;
+    context = c;
+    logThread = std::thread ([&]() {
+      while (!task->hasQuit())
+      {
+        auto timeInfo = context->getTimeInfo();
+        std::cout << "bpm:" << timeInfo.bpm << "\n";
+        std::cout << "phase:" << timeInfo.quarterNotesPhase_[0] << "\n";
+        std::cout << "samples since start:" << timeInfo.samplesSinceStart << "\n";
+        std::cout << "output 0-0:" << context->outputs[0][0] << "\n";
+        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+      }
+    });
+  }
+  
+  ~ContextLogger() { logThread.join(); }
+  
+  AudioTask* task;
+  AudioContext* context;
+  std::thread logThread;
+};
+
 int main( int argc, char *argv[] )
 {
   EventsToSignals eventsToSignals;
@@ -42,7 +68,6 @@ int main( int argc, char *argv[] )
     for ( int i=0; i<m.size(); i++ )
       std::cout << (int)m[i] << " ";
     std::cout << "\n";
-
     eventsToSignals.addEvent(MIDIMessageToEvent(m));
   };
 
@@ -70,11 +95,11 @@ int main( int argc, char *argv[] )
   std::string testCode = R"(
   MOV R1, #5          ; Move immediate 5 to R1
   ADD R0, R1, #1      ; Add R1 + 1, store in R0
-  LDR R2, =3.0   ; Load literal from pool into R2
+  LDR R2, =1.0        ; Load literal from pool into R2
   LDR R0, =0.         ; Load literal from pool into R0
   STR R2, [#3]        ; Store R2 to arena at offset 3
   MUL R0, R1, R2      ; Multiply R1 * R2, store in R0
-  MUL R0, R0, #0      ; Mul r0 * 0 : don't make sound 
+  MUL R0, R0, #1      ; Mul r0 * 0 : don't make sound 
   END
   )";
 
@@ -90,6 +115,7 @@ int main( int argc, char *argv[] )
   
   AudioContext ctx(kInputChannels, kOutputChannels);
   AudioTask exampleTask(&ctx, processAudio, &state);
+  ContextLogger log(&exampleTask, &ctx);
   
   // roll onward at 120 bpm
   ctx.updateTime(0, 120.0, true, kSampleRate);

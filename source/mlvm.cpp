@@ -128,18 +128,6 @@ void MLVM::process(AudioContext* context) {
     context->outputs[i] = registers[i];
   }
 
-  // TEMP
-  static int testCounter{0};
-  const int nSamples = context->getSampleRate();
-  auto timeInfo = context->getTimeInfo();
-  testCounter += kFramesPerBlock;
-  if (testCounter >= nSamples) {
-    testCounter -= nSamples;
-    std::cout << "bpm:" << timeInfo.bpm << "\n";
-    std::cout << "phase:" << timeInfo.quarterNotesPhase_[0] << "\n";
-    std::cout << "samples since start:" << timeInfo.samplesSinceStart << "\n";
-    std::cout << "output 0-0:" << context->outputs[0][0] << "\n";
-  }
 }
 
 } // namespace ml
