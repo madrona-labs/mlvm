@@ -10,7 +10,7 @@ bool MLVM::allocateMemory(const MemoryRequirements& memReqs) {
   registers.resize(kNumRegisters);
   
   // TODO errors
-  arena.resize(memReqs.stateVectors + memReqs.scratchVectors);
+  arenas.resize(memReqs.stateVectors + memReqs.scratchVectors);
   return true;
 }
 
@@ -18,61 +18,23 @@ void MLVM::setProgram(const Program& newCode) {
   program = newCode;
 }
 
-// get the value from the operand, handling the register addressing modes.
-SignalBlock MLVM::getValue(Operand op)
-{
-  SignalBlock result;
-  switch(getOperandMode(op))
-  {
-    case REGISTER:
-      result = registers[getIndex(op)];
-      break;
-    case IMMEDIATE:
-      // fill vector with float immediate
-      result = SignalBlock(getImmediate(op));
-      break;
-  }
-  return result;
-}
+// update docs:
+// a float is the smallest thing in an arena, so arena chunk size 1 means 4 bytes.
+// arena instructions all have a bank size operand, so multiply the arena pointer
+// by the bank size.
 
-// get the value from the two operands, handling the memory addressing modes.
-SignalBlock MLVM::getValue2(Operand op1, Operand op2, const std::vector< float >& literals)
+chug chug
+float* MLVM::getArenaPtr(uint8_t arenaIdx, uint8_t chunk, uint8_t bankSize)
 {
-  SignalBlock result;
-  size_t offset = (getIndex(op1) << 7) | getIndex(op2);
-  switch(getOperandMode(op1))
-  {
-    case ARENA:
-      result = arena[offset];
-      break;
-    case LITERAL:
-      // fill vector with float literal
-      result = SignalBlock(literals[offset]);
-      break;
-  }
-  return result;
-}
-
-// get destination from the two operands, handling the memory addressing modes.
-SignalBlock* MLVM::getDest2(Operand op1, Operand op2)
-{
-  SignalBlock* result{nullptr};
-  size_t offset = (getIndex(op1) << 7) | getIndex(op2);
-  switch(getOperandMode(op1))
-  {
-    case ARENA:
-      result = &arena[offset];
-      break;
-    default:
-      // return null and probably crash - literal mode
-      // for dest doesn't make sense
-      break;
-  }
-  return result;
+  size_t arenaChunkSizeInBytes = arenas[arenaIdx].chunkSize*4*bankSize;
+  return arenas[arenaIdx].floatVec.data() + chunk*arenaChunkSizeInBytes;
 }
 
 void MLVM::process(AudioContext* context) {
-  size_t destIdx, srcIdx1, srcIdx2;
+  
+  // operands
+  uint8_t destIdx;
+  SignalBlock src1, src2, src3;
   SignalBlock v1, v2;
   
   // main inputs / outputs are dynamic, so check them
@@ -85,25 +47,44 @@ void MLVM::process(AudioContext* context) {
   }
 
   // Here is the innermost loop that interprets the bytecode program.
-  // The program will generate one vector of output.
+  // The program will generate one SignalBlock of output.
   // NOTE: Aside from the main switch, there should be few if any branches.
   
   programCounter = 0;
   while(1) {
     auto inst = program.instructions[programCounter++];
-    destIdx = getIndex(inst.dest);
+    
+    // decode operands. The ISA has the property that if an operand exists, it
+    // is in the same location for all operations that use it. Also there are
+    // not a ton of operands. So we decode them all here before the opcode switch.
+    
+    uint8_t opcode = getOpcode(inst);
+    uint8_t b1 = inst[1]; // dest idx
+    uint8_t b2 = inst[2]; // src1 idx
+    uint8_t b3 = inst[3]; // bank size
+    uint8_t b4 = inst[4]; // src2 idx, params arena
+    uint8_t b5 = inst[5]; // src3 idx, params chunk, element #
+    uint8_t b6 = inst[6]; // state arena, projection type, jmp offset 8:15
+    uint8_t b7 = inst[7]; // state chunk, jmp offset 8:15
 
-    v1 = getValue(inst.src1);
-    v2 = getValue(inst.src2);
+    // by grouping the memory opcodes together and so on, we can do quick bit tests
+    // to decide if pointers, values immediates and so on need to be decoded. for now,
+    // do them all.
+    float32_t f0 = getFloatImmediate(inst);
+    int16_t offset = getAddressOffset(inst);
+    SignalBlock* paramsPtr = getArenaPtr(b4, b5, b3);
+    SignalBlock* statePtr = getArenaPtr(b6, b7, b3);
 
-    switch (inst.opcode) {
+    switch (opcode) {
       case NOOP:
         break;
+      case END:
+        goto endprogram;
       case MOVE:
-        registers[destIdx] = v1;
+        registers[destIdx] = registers[src1Idx];
         break;
       case LOAD:
-        registers[destIdx] = getValue2(inst.src1, inst.src2, program.literalPool);
+        registers[destIdx] = getValue2(inst.src1, inst.src2);
         break;
       case STORE:
         // in a store, src and dest are reversed
@@ -115,8 +96,7 @@ void MLVM::process(AudioContext* context) {
       case MUL:
         registers[destIdx] = multiply(v1, v2);
         break;
-      case END:
-        goto endprogram;
+
     }
   }
 

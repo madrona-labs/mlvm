@@ -10,7 +10,7 @@
 namespace mlvm {
 
 
-Program ToyAssembler::assemble(const std::string& assemblyCode) {
+Program Assembler::assemble(const std::string& assemblyCode) {
   Program program;
   program.memReqs = {0, 0}; // Default memory requirements
   
@@ -80,7 +80,7 @@ Program ToyAssembler::assemble(const std::string& assemblyCode) {
   return program;
 }
   
-void ToyAssembler::printProgram(const Program& program) {
+void Assembler::printProgram(const Program& program) {
   std::cout << "Program with " << program.instructions.size() << " instructions:\n";
   
   for (size_t i = 0; i < program.instructions.size(); ++i) {

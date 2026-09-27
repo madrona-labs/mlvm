@@ -6,8 +6,11 @@
 
 #include <iostream>
 #include "madronalib.h"
+
+// TODO figure out better private interface setup
 #include "mlvm.h"
 #include "assembler.h"
+
 
 using namespace mlvm;
 
@@ -90,7 +93,7 @@ int main( int argc, char *argv[] )
 
   // but right now we can use a toy assembler to write a
   // program that is like a single module
-  ToyAssembler assembler;
+  Assembler assembler;
 
   std::string testCode = R"(
   MOV R1, #5          ; Move immediate 5 to R1

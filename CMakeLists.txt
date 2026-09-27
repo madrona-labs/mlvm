@@ -116,7 +116,7 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 file(GLOB APP_SOURCES "source/*.cpp")
 file(GLOB APP_HEADERS "source/*.h")
-file(GLOB APP_HEADERS "include/*.h")
+file(GLOB EXT_HEADERS "include/*.h")
 
 # set the sources - we include the headers only to make them 
 # navigable within IDEs
@@ -124,6 +124,7 @@ file(GLOB APP_HEADERS "include/*.h")
 set(mlvm_SOURCES
     ${APP_SOURCES}
     ${APP_HEADERS}
+    ${EXT_HEADERS}
     )
 
 set(MLVM_INCLUDE_DIRS
@@ -213,7 +214,7 @@ endif()
 install(FILES include/mlvm.h DESTINATION ${INCLUDES_INSTALL_DIR})
 
 install(FILES 
-    ${APP_HEADERS}
+    ${EXT_HEADERS}
     DESTINATION 
     # PERMISSIONS OWNER_READ GROUP_READ WORLD_READ
     ${INCLUDES_INSTALL_DIR}

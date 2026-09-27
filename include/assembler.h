@@ -20,7 +20,7 @@
 namespace mlvm {
 
 // Assembler implementation
-class ToyAssembler {
+class Assembler {
 private:
   std::unordered_map<std::string, operations> opMap;
   
@@ -218,7 +218,7 @@ private:
   
   
 public:
-  ToyAssembler() {
+  Assembler() {
     initializeOpMap();
   }
   

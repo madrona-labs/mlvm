@@ -5,24 +5,44 @@
 
 #include "madronalib.h"
 
+
+// TODO make external interface
+
+
 namespace mlvm {
-
-
-// OPCODES tell our virtual machine what to do. They have an operation and a mode.
 
 using Opcode = uint8_t;
 
-constexpr int kOpcodeOperationBits{6};
-constexpr int kNumOperations{1 << kOpcodeOperationBits};
-constexpr uint8_t kOpcodeOperationMask{ (uint8_t)kNumOperations - 1 };
-constexpr uint8_t kOpcodeModeMask{ (uint8_t)~kOpcodeOperationMask };
-
-inline size_t getOperationMode(Opcode m) { return (m&kOpcodeModeMask) >> kOpcodeOperationBits; }
-inline size_t getOperation(Opcode m) { return (m&kOpcodeOperationMask); }
-
 enum operations {
+  // System
   NOOP = 0,
   END,
+  // One-input math
+  SIN,
+  LOG,
+  EXP,
+  NEG,
+  ABS,
+  RCP,
+  // Two-input math
+  ADD,
+  ADD_WRAP,
+  SUB,
+  SUB_WRAP,
+  MUL,
+  DIV,
+  // Three-input math
+  LERP,
+  CLAMP,
+  SELECT,
+  // Generators
+  SINE,
+  IMPULSE,
+  SAW,
+  NOISE,
+  // Filters
+  SVF,
+  // Memory access
   MOVE,     // register -> register
   MOVE1,
   LOAD,     // memory -> register
@@ -31,85 +51,103 @@ enum operations {
   CMP,
   BNE,
   JMP,
-  ADD,
-  TEST1,
-  TEST2,
-  MUL,
+
   SHIFT,
   INTERP,
-  SVF,       // dest, src, state
   // ... and many more
   // many opcodes will be much bigger chunks of stateful work like oscillators, table lookups,
   // env followers, and in general DSP machinery.
-  NUM_OPERATIONS
+  NUM_OPCODES
 };
 
-static_assert(NUM_OPERATIONS < kNumOperations);
+static_assert(NUM_OPCODES < (1<<8));
 
-// reserved
-enum opcodeModes {
-  MODE_0 = 0,
-  MODE_1
+/*
+// INSTRUCTIONS are 1-byte opcodes followed by 7 bytes of operands.
+
+// one-, two- and three-input math
+struct MathFields {
+  uint8_t opcode;
+  uint8_t dest;
+  uint8_t src1;
+  uint8_t src2;
+  uint8_t src3;
+  uint8_t unused1;
+  uint8_t unused2;
+  uint8_t bankSize;
 };
 
-
-// OPERANDS specify sources and destinations for operations. They have an index and a mode.
-// The mode specifies how the index will be used to calculate a source or destination.
-
-using Operand = uint8_t;
-
-constexpr size_t kOperandIndexBits{7};
-constexpr size_t kNumOperandIndexes{1 << kOperandIndexBits};
-constexpr size_t kNumRegisters{kNumOperandIndexes};
-constexpr uint8_t kOperandIndexMask{ (uint8_t)kNumOperandIndexes - 1 };
-constexpr uint8_t kOperandModeMask{ (uint8_t)~kOperandIndexMask };
-
-inline size_t getOperandMode(Operand m) { return (m&kOperandModeMask) >> kOperandIndexBits; }
-inline size_t getIndex(Operand m) { return (m&kOperandIndexMask); }
-
-
-// Register operands have two modes: register and immediate.
-// In the register mode the source or destination is one of the registers.
-// In the immediate mode the source is a float encoded as a 7-bit value.
-
-enum registerAddressModes {
-  REGISTER = 0,
-  IMMEDIATE = 1
+// generators, filters, shapes, delays
+struct FilterFields {
+  uint8_t opcode;
+  uint8_t dest;
+  uint8_t src;
+  uint8_t paramsArena;
+  uint8_t paramsChunk;
+  uint8_t stateArena;
+  uint8_t stateChunk;
+  uint8_t bankSize;
 };
 
-// NOTE how to encode immediates? 2^n with an offset, or possibly even a table of 128 useful values.
-
-// SILLY - JUST MAKE ROOM FOR FLOAT32
-
-// table idea: 0, [1/64 -- 1/2], [1 -- 64]
-inline float getImmediate(Operand op) { return float(getIndex(op)); }
-
-// Memory operands have two modes: arena and literal.
-// In the arena mode the program's persistent working memory is the source or destination.
-// Arena loads / stores will use two of the operands to make a memory offset.
-// In the literal mode the source is stored in the program memory, in what would be the
-// following instruction.
-
-enum memoryAddressModes {
-  ARENA = 0,
-  LITERAL = 1
+// projections
+struct ProjectionFields {
+  uint8_t opcode;
+  uint8_t dest;
+  uint8_t src;
+  uint8_t paramsArena;
+  uint8_t paramsChunk;
+  uint8_t projectionType;
+  uint8_t unused1;
+  uint8_t bankSize;
 };
 
-// INSTRUCTIONS are combinations of opcodes and operands.
-
-struct Instruction {
-  Opcode opcode;
-  Operand dest;
-  Operand src1;
-  Operand src2;
+// memory access
+struct MemoryFields {
+  uint8_t opcode;
+  uint8_t dest;
+  uint8_t src;
+  uint8_t unused1;
+  float32_t immediate;
 };
+*/
 
-// Instructions are 4 bytes long.
 
-static_assert(sizeof(Instruction) == 4);
+// ...
 
-// for a few instructions like MUL_ADD, the operands can be restricted to registers, so we
-// can pack four register indices (6 bits * 4) as operands if we want to.
+/*
+union Instruction {
+  MathFields math;
+  FilterFields filters;
+  ProjectionFields proj;
+  MemoryFields mem;
+};
+ static_assert(sizeof(Instruction) == 8);
+*/
+
+using Instruction = uint8_t[8];
+
+// THIS is newer than document! update that!
+
+static inline Opcode getOpcode(Instruction t) { return t[0]; }
+static inline uint8_t getDestIdx(Instruction t) { return t[1]; }
+static inline uint8_t getSrc1Idx(Instruction t) { return t[2]; }
+static inline uint8_t getBankSize(Instruction t) { return t[3]; }
+
+// src 2 comes after bank size so we can have an inst. with dest, src1, bank size and immediate
+// and have the immediate float32 aligned.
+
+static inline uint8_t getSrc2Idx(Instruction t) { return t[4]; }
+static inline uint8_t getSrc3Idx(Instruction t) { return t[5]; }
+static inline uint8_t getStateArena(Instruction t) { return t[6]; }
+static inline uint8_t getStateChunk(Instruction t) { return t[7]; }
+
+static inline float32_t getFloatImmediate(Instruction t) {
+  return *(reinterpret_cast<float32_t*>(&t[4]));
+}
+
+static inline uint16_t getAddressOffset(Instruction t) {
+  return *(reinterpret_cast<uint16_t*>(&t[6]));
+}
 
 struct MemoryRequirements {
   // number of vectors a module or program needs to store its persistent state.
@@ -124,13 +162,17 @@ struct MemoryRequirements {
 
 struct Program {
   std::vector< Instruction > instructions;
-  std::vector< float > literalPool;
   MemoryRequirements memReqs;
 };
 
+struct FloatArena {
+  std::vector< float > floatVec;
+  size_t chunkSizeInFloats;
+};
+
 struct MLVM {
-  std::vector< SignalBlock > registers;
-  std::vector< SignalBlock > arena;
+  std::array< SignalBlock, 256 > registers;
+  std::array< FloatArena, 256 > arenas;
   Program program;
   uint32_t programCounter;
   
@@ -150,12 +192,15 @@ struct MLVM {
 
   bool allocateMemory(const MemoryRequirements&);
   void setProgram(const Program& newCode);
+  
+  // process in a given context - the context contains audio i/o, event i/o, and time/beats info.
   void process(AudioContext* context);
   
 private:
-  SignalBlock getValue(Operand op1);
-  SignalBlock getValue2(Operand op1, Operand op2, const std::vector< float >& literals);
-  SignalBlock* getDest2(Operand op1, Operand op2);
+  // return a float ptr into the arena, which might contain parameters
+  // or SignalBlocks.
+  float* getArenaPtr(uint8_t arena, uint8_t chunk, uint8_t bankSize);
+
 
 };
 
