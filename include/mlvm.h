@@ -62,67 +62,6 @@ enum operations {
 
 static_assert(NUM_OPCODES < (1<<8));
 
-/*
-// INSTRUCTIONS are 1-byte opcodes followed by 7 bytes of operands.
-
-// one-, two- and three-input math
-struct MathFields {
-  uint8_t opcode;
-  uint8_t dest;
-  uint8_t src1;
-  uint8_t src2;
-  uint8_t src3;
-  uint8_t unused1;
-  uint8_t unused2;
-  uint8_t bankSize;
-};
-
-// generators, filters, shapes, delays
-struct FilterFields {
-  uint8_t opcode;
-  uint8_t dest;
-  uint8_t src;
-  uint8_t paramsArena;
-  uint8_t paramsChunk;
-  uint8_t stateArena;
-  uint8_t stateChunk;
-  uint8_t bankSize;
-};
-
-// projections
-struct ProjectionFields {
-  uint8_t opcode;
-  uint8_t dest;
-  uint8_t src;
-  uint8_t paramsArena;
-  uint8_t paramsChunk;
-  uint8_t projectionType;
-  uint8_t unused1;
-  uint8_t bankSize;
-};
-
-// memory access
-struct MemoryFields {
-  uint8_t opcode;
-  uint8_t dest;
-  uint8_t src;
-  uint8_t unused1;
-  float32_t immediate;
-};
-*/
-
-
-// ...
-
-/*
-union Instruction {
-  MathFields math;
-  FilterFields filters;
-  ProjectionFields proj;
-  MemoryFields mem;
-};
- static_assert(sizeof(Instruction) == 8);
-*/
 
 using Instruction = uint8_t[8];
 
@@ -149,16 +88,6 @@ static inline uint16_t getAddressOffset(Instruction t) {
   return *(reinterpret_cast<uint16_t*>(&t[6]));
 }
 
-struct MemoryRequirements {
-  // number of vectors a module or program needs to store its persistent state.
-  size_t stateVectors;
-  
-  // number of scratch memory vectors a module needs for temporary storage -
-  // not saved between process() calls. Typically a program will allocate scratch
-  // storage for the module needing the most scratch, and all modules will share
-  // that scratch area.
-  size_t scratchVectors;
-};
 
 struct Program {
   std::vector< Instruction > instructions;
@@ -168,15 +97,17 @@ struct Program {
 struct FloatArena {
   std::vector< float > floatVec;
   size_t chunkSizeInFloats;
+  
+  void clear() { floatVec.clear(); chunkSizeInFloats = 0; }
 };
 
 struct MLVM {
+  // uint8_t indices are baked into the design, so we just use std::array and
+  // grab 2^8 registerrs and arenas.
   std::array< SignalBlock, 256 > registers;
   std::array< FloatArena, 256 > arenas;
   Program program;
   uint32_t programCounter;
-  
-  //void compile(const JSON& dspGraphInput, Program& programOutput); // TODO - takes JSON list of modules and connections and parameters, makes opcodes and memory needs
   
   // NOTES
   // A benefit from compiling the module graph into opcodes is that we can take care of any mode-switch
@@ -190,8 +121,8 @@ struct MLVM {
   //
   // For crossfades on changes and super-quick undo, we can keep N versions of the program.
 
-  bool allocateMemory(const MemoryRequirements&);
-  void setProgram(const Program& newCode);
+
+  void load(const Program& newCode);
   
   // process in a given context - the context contains audio i/o, event i/o, and time/beats info.
   void process(AudioContext* context);

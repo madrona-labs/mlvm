@@ -29,9 +29,33 @@ struct VMExampleState {
 void processAudio(AudioContext* ctx, VMExampleState* state)
 {
   MLVM* vm = state->vm;
-
+  
+  // copy audio, events and time inputs to vm registers
+  
+  // copy audio inputs to registers 0–7
+  for(int i=0; i<context->inputs.size(); ++i)
+  {
+    registers[i] = context->inputs[i];
+  }
+  
+  // copy event inputs to registers 8–15
+  for(int i=0; i<context->inputs.size(); ++i)
+  {
+    registers[i] = context->inputs[i];
+  }
+  
+  // copy time info to registers 16–17
+  for(int i=0; i<context->inputs.size(); ++i)
+  {
+    registers[i] = context->inputs[i];
+  }
+  
   // run vm
   vm->process(ctx);
+  
+  // copy vm output registers to outputs
+  
+  
 }
 
 struct ContextLogger

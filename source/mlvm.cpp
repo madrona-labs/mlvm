@@ -5,16 +5,19 @@
 
 namespace mlvm {
 
-bool MLVM::allocateMemory(const MemoryRequirements& memReqs) {
-  // TODO errors
-  registers.resize(kNumRegisters);
+bool MLVM::allocateArenas() {
+  bool success{true};
+
+  // clear all arenas
+  for(auto& a : arenas) a.clear();
   
-  // TODO errors
-  arenas.resize(memReqs.stateVectors + memReqs.scratchVectors);
-  return true;
+  // allocate arenas in manifest
+  // TODO
+  
+  return success;
 }
 
-void MLVM::setProgram(const Program& newCode) {
+void MLVM::load(const Program& newCode) {
   program = newCode;
 }
 
@@ -39,13 +42,8 @@ void MLVM::process(AudioContext* context) {
   
   // main inputs / outputs are dynamic, so check them
   if (context->outputs.size() < 1) return;
-  
-  // copy inputs to registers
-  for(int i=0; i<context->inputs.size(); ++i)
-  {
-    registers[i] = context->inputs[i];
-  }
 
+  
   // Here is the innermost loop that interprets the bytecode program.
   // The program will generate one SignalBlock of output.
   // NOTE: Aside from the main switch, there should be few if any branches.
@@ -64,50 +62,48 @@ void MLVM::process(AudioContext* context) {
     uint8_t b3 = inst[3]; // bank size
     uint8_t b4 = inst[4]; // src2 idx, params arena
     uint8_t b5 = inst[5]; // src3 idx, params chunk, element #
-    uint8_t b6 = inst[6]; // state arena, projection type, jmp offset 8:15
+    uint8_t b6 = inst[6]; // state arena, projection type, jmp offset 0:7
     uint8_t b7 = inst[7]; // state chunk, jmp offset 8:15
+    
+    // operations that have a 32 bit float immediate value store it in fields 4–7.
 
     // by grouping the memory opcodes together and so on, we can do quick bit tests
-    // to decide if pointers, values immediates and so on need to be decoded. for now,
-    // do them all.
+    // to decide if params and state pointers, values, immediates and so on need
+    // to be decoded. for now, do them all.
     float32_t f0 = getFloatImmediate(inst);
     int16_t offset = getAddressOffset(inst);
-    SignalBlock* paramsPtr = getArenaPtr(b4, b5, b3);
-    SignalBlock* statePtr = getArenaPtr(b6, b7, b3);
+    float* arenaPtr1 = getArenaPtr(b4, b5, b3); // params, load src or store dest
+    float* arenaPtr2 = getArenaPtr(b6, b7, b3); // state
 
+
+    
     switch (opcode) {
       case NOOP:
         break;
       case END:
         goto endprogram;
       case MOVE:
-        registers[destIdx] = registers[src1Idx];
+        registers[b1] = registers[b2];
         break;
       case LOAD:
-        registers[destIdx] = getValue2(inst.src1, inst.src2);
+        memcpy(&registers[b1], arenaPtr1, sizeof(SignalBlock));
         break;
       case STORE:
-        // in a store, src and dest are reversed
-        *(getDest2(inst.src1, inst.src2)) = getValue(inst.dest);
+        // in a store, src and dest are reversed in order to index arena destination
+        memcpy(arenaPtr1, &registers[b1], sizeof(SignalBlock));
         break;
       case ADD:
-        registers[destIdx] = add(v1, v2);
+        registers[b1] = add(registers[b2], registers[b4]);
         break;
       case MUL:
-        registers[destIdx] = multiply(v1, v2);
-        break;
+        registers[b1] = multiply(registers[b2], registers[b4]);
+       break;
 
     }
   }
 
   endprogram:
-  
-  // copy registers to outputs
-  for(int i=0; i<context->outputs.size(); ++i)
-  {
-    context->outputs[i] = registers[i];
-  }
-
+  return;
 }
 
 } // namespace ml
