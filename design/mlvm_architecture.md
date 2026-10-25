@@ -139,6 +139,10 @@ To run a program, the client writes input signals including audio and events int
 - Registers are **transient**: they live only within a block execution  
 - Addressed by 8-bit index (0–255)
 
+#### Block size (note, Oct 2026)
+
+The 16-frame block above is the goal, not the current state. madronalib's `kFramesPerBlock` is 64 today, and current shipping plugins run at block size 64. The hope is that madronalib and mlvm will make efficient plugins possible at block size 16. However, **everything must work at block sizes up to 256**, in case future low-end platforms need it. A longer block makes registers longer: at 64 frames a register is 256 bytes and the register file is 64KB, at 256 frames it is 256KB, which no longer fits the L1 budget argued above. The time/space tradeoffs (fewer registers, a smaller register file, or accepting L2 for the register file at large block sizes) are to be explored later. Nothing in the ISA depends on the block size; the control-rate encodings in particular were chosen to be block-size agnostic.
+
 ### Arenas
 
 Memory outside the register file is organized into arenas — flat byte buffers addressed by an 8-bit arena selector and an 8-bit chunk index, where each arena has its own chunk size. A small-state arena might use 16-byte chunks for filter coefficients and oscillator phase; a delay arena might use 4KB chunks to address large buffers. This gives 256 addressable chunks per arena, with total capacity scaling with chunk size. Arenas are the home for all persistent state: filter coefficients and history, oscillator phase, delay lines, and so on. Arenas are expected to live in L2 or beyond; the compiler is responsible for arranging objects within arenas to be as cache-friendly as possible, grouping hot small states together and pushing large cold states toward the back. There is no dynamic allocation at runtime — all arena layout, including chunk sizes, is fixed at patch compile time.
@@ -301,7 +305,7 @@ After that: stateful operator state layouts (SAW, SVF), bank inner loops, time i
 ## Key decisions log
 
 - **Register machine, not stack**: fewer dispatches, explicit operands  
-- **16 floats per register block**: fits one cacheline (64 bytes), confirmed safe for 32KB L1, allows global feedback up to 3kHz at sr=48k
+- **16 floats per register block**: fits one cacheline (64 bytes), confirmed safe for 32KB L1, allows global feedback up to 3kHz at sr=48k. This is the target; shipping plugins use 64 today and sizes up to 256 must work. See "Block size" under Registers.
 - **Fixed 64-bit instructions**: simple fetch, good I-cache density  
 - **Variable chunk size arenas**: one 8-bit chunk index works for 16-byte filter state and 4KB delay chunks alike — chunk size declared in manifest, not in instruction  
 - **Buffers are part of state**: state for a delay or audio playback object might include playhead position and filter states, then buffer memory  
