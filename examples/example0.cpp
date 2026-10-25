@@ -32,10 +32,11 @@ void processAudio(AudioContext* context, VMExampleState* state)
 
 struct ContextLogger
 {
-  ContextLogger(AudioTask* t, AudioContext* c)
+  ContextLogger(AudioTask* t, AudioContext* c, MLVM* v)
   {
     task = t;
     context = c;
+    vm = v;
     logThread = std::thread ([&]() {
       while (!task->hasQuit())
       {
@@ -44,15 +45,18 @@ struct ContextLogger
         std::cout << "phase:" << timeInfo.quarterNotesPhase_[0] << "\n";
         std::cout << "samples since start:" << timeInfo.samplesSinceStart << "\n";
         std::cout << "output 0-0:" << context->outputs[0][0] << "\n";
+        // r1 holds voice 0's pitch from LOAD_K: play MIDI notes and watch it follow.
+        std::cout << "voice 0 pitch (r1):" << vm->registers[1][0] << "\n";
         std::this_thread::sleep_for(std::chrono::milliseconds(1000));
       }
     });
   }
-  
+
   ~ContextLogger() { logThread.join(); }
-  
+
   AudioTask* task;
   AudioContext* context;
+  MLVM* vm;
   std::thread logThread;
 };
 
@@ -90,14 +94,15 @@ int main( int argc, char *argv[] )
   // but right now we can use the assembler to write a
   // program that is like a single module.
   // Outputs are read from registers starting at kOutputRegisterBase.
+  // The "events" arena receives control-rate voice data from the host every block.
+  // Chunk 0 is channel 0, row 0 (pitch). LOAD_K ramps voice 0's pitch into r1.
+  // Oscillators are still stubs, so the outputs stay silent for now.
   const char* testCode = R"(
-    ARENA scratch 16
+    ARENA events 64
 
-    LOAD_I r1, 0.0f           // silence
-    LOAD_I r2, 0.5f
-    MUL    r3, r1, r2
-    STORE  r3, scratch/0
-    LOAD   r8, scratch/0      // output 0
+    LOAD_K r1, events/0       // voice 0 pitch, audio rate
+    LOAD_I r2, 0.0f
+    MUL    r8, r1, r2         // output 0: silence
     MOVE   r9, r8             // output 1
     HALT
   )";
@@ -118,7 +123,7 @@ int main( int argc, char *argv[] )
   
   AudioContext ctx(kInputChannels, kOutputChannels);
   AudioTask exampleTask(&ctx, processAudio, &state);
-  ContextLogger log(&exampleTask, &ctx);
+  ContextLogger log(&exampleTask, &ctx, &vm);
   
   // roll onward at 120 bpm
   ctx.updateTime(0, 120.0, true, kSampleRate);

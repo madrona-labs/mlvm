@@ -13,9 +13,25 @@ using namespace ml;
 
 namespace mlvm {
 
+// the event arena mirrors madronalib's control-rate layout exactly.
+static_assert(MLVM::kEventRows == ml::kNumControlRows, "event arena rows must match VoiceControls");
+static_assert(MLVM::kEventChunkFloats * sizeof(float) == sizeof(ml::ControlRow), "event chunk must be one ControlRow");
+static_assert(MLVM::kControlBlockFloats * sizeof(float) == sizeof(ml::ControlBlock), "ControlBlock must be one float4");
+static_assert(sizeof(ml::VoiceControls) == MLVM::kEventRows * MLVM::kEventChunkFloats * sizeof(float),
+              "one channel of VoiceControls must fill kEventRows consecutive chunks");
+
 // allocate arena memory as described in the manifest and store the program.
 bool MLVM::loadProgram(const Program& newProgram) {
   if (newProgram.manifest.size() > kNumArenas) return false;
+
+  // the event arena, if declared, must have the ControlRow chunk size.
+  int newEventArenaIdx = -1;
+  for (size_t i = 0; i < newProgram.manifest.size(); ++i) {
+    if (newProgram.manifest[i].name == kEventArenaName) {
+      if (newProgram.manifest[i].chunkSizeInFloats != kEventChunkFloats) return false;
+      newEventArenaIdx = static_cast<int>(i);
+    }
+  }
 
   for (auto& a : arenas) a.clear();
   for (size_t i = 0; i < newProgram.manifest.size(); ++i) {
@@ -25,6 +41,7 @@ bool MLVM::loadProgram(const Program& newProgram) {
   }
 
   program = newProgram;
+  eventArenaIdx = newEventArenaIdx;
   programCounter = 0;
   flag = false;
   return true;
@@ -88,6 +105,24 @@ void MLVM::run() {
       case LOAD_I:
         registers[b1] = SignalBlock(getFloatImmediate(inst));
         break;
+      case LOAD_K: {
+        // control-rate chunk (one ml::ControlRow: 16 ControlBlocks, one per voice) to
+        // audio rate. A ramp moves from start to end, landing on end at the last frame;
+        // a step holds start until its frame, then end. Bank size 0 converts voice 0
+        // into dest. Bank size N converts voices 0..N-1 into dest..dest+N-1, one voice
+        // per register, horizontal.
+        // TODO: replace the banked case with the vertical 4x4 layout once the bank
+        // layout TODO in the architecture doc is resolved.
+        const float* chunk = getArenaPtr(b4, b5, 0);  // one chunk holds all voices: no bank stride
+        if (!chunk) break;
+        const size_t nVoices = std::min<size_t>(b3 ? b3 : 1, kEventChunkFloats / kControlBlockFloats);
+        for (size_t v = 0; v < nVoices && (b1 + v) < kNumRegisters; ++v) {
+          ControlBlock c;
+          std::memcpy(&c, chunk + kControlBlockFloats * v, sizeof(c));
+          registers[b1 + v] = interpolateBlockLinear(c);
+        }
+        break;
+      }
       case LOAD:
         if (float* src = getArenaPtr(b4, b5, b3)) {
           std::memcpy(registers[b1].data(), src, sizeof(SignalBlock));
@@ -180,7 +215,20 @@ void MLVM::processBlock(AudioContext* context) {
     registers[kInputRegisterBase + i] = context->inputs[static_cast<int>(i)];
   }
 
-  // TODO: copy time info and event signals (converting k-rate to a-rate) into registers.
+  // copy control-rate event data for each channel into the event arena, if the
+  // program declared one. One channel's VoiceControls fills kEventRows chunks.
+  if (eventArenaIdx >= 0) {
+    FloatArena& events = arenas[eventArenaIdx];
+    const size_t floatsPerChannel = kEventRows * kEventChunkFloats;
+    const size_t nChannels = std::min<size_t>(context->getNumEventChannels(), kMaxEventChannels);
+    for (size_t ch = 0; ch < nChannels; ++ch) {
+      if ((ch + 1) * floatsPerChannel > events.floatVec.size()) break;
+      std::memcpy(events.floatVec.data() + ch * floatsPerChannel,
+                  &context->getInputVoiceControls(static_cast<int>(ch)), sizeof(VoiceControls));
+    }
+  }
+
+  // TODO: time info (tempo, beat phase, samples since start) as a control-rate chunk.
 
   run();
 

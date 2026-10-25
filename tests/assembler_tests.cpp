@@ -6,6 +6,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <string>
 
 #include "assembler.h"
@@ -206,6 +207,59 @@ void testVMOutOfRangeArenaIsSafe() {
   CHECK(vm.registers[2][0] == 0.f);
 }
 
+void testLoadK() {
+  using namespace mlvm;
+  auto r = assemble(R"(
+    ARENA events 64          // one ml::ControlRow per chunk: 16 voices x 4 floats
+    LOAD_K   r1, events/0    // voice 0 of row 0
+    LOAD_K.3 r4, events/3    // voices 0, 1, 2 of row 3 into r4, r5, r6
+    HALT
+  )");
+  if (!r.ok()) printErrors(r);
+  CHECK(r.ok());
+  if (r.program.instructions.size() != 3) { ++failures; return; }
+  const auto& code = r.program.instructions;
+  CHECK((code[0] == Instruction{LOAD_K, 1, 0, 0, 0, 0, 0, 0}));
+  CHECK((code[1] == Instruction{LOAD_K, 4, 0, 3, 0, 3, 0, 0}));
+
+  MLVM vm;
+  CHECK(vm.loadProgram(r.program));
+  CHECK_EQ(vm.eventArenaIdx, 0);
+  CHECK_EQ(vm.arenas[0].floatVec.size(), 256u * 64u);
+
+  // write ControlBlocks straight into the arena, as processBlock would.
+  auto writeBlock = [&](size_t row, size_t voice, ml::ControlBlock c) {
+    std::memcpy(vm.arenas[0].floatVec.data() + row * 64 + voice * 4, &c, sizeof(c));
+  };
+  writeBlock(0, 0, ml::ControlBlock::ramp(0.f, 1.f));
+  writeBlock(3, 0, ml::ControlBlock::ramp(2.f, 2.f));     // flat
+  writeBlock(3, 1, ml::ControlBlock::ramp(-1.f, 0.f));
+  writeBlock(3, 2, ml::ControlBlock::step(-1.f, 5.f, 6));  // step at frame 6
+  vm.run();
+
+  const size_t last = ml::kFramesPerBlock - 1;
+  CHECK(vm.registers[1][last] == 1.f);
+  CHECK(std::fabs(vm.registers[1][0] - 1.f / ml::kFramesPerBlock) < 1e-6f);
+  for (size_t i = 1; i < ml::kFramesPerBlock; ++i) CHECK(vm.registers[1][i] > vm.registers[1][i - 1]);
+  for (size_t i = 0; i < ml::kFramesPerBlock; ++i) CHECK(vm.registers[4][i] == 2.f);
+  CHECK(vm.registers[5][last] == 0.f);
+  CHECK(std::fabs(vm.registers[5][0] - (-1.f + 1.f / ml::kFramesPerBlock)) < 1e-6f);
+  for (size_t i = 0; i < 6; ++i) CHECK(vm.registers[6][i] == -1.f);
+  for (size_t i = 6; i < ml::kFramesPerBlock; ++i) CHECK(vm.registers[6][i] == 5.f);
+
+  // an events arena with the wrong chunk size is refused
+  auto bad = assemble("ARENA events 32\nHALT\n");
+  CHECK(bad.ok());
+  MLVM vm2;
+  CHECK(!vm2.loadProgram(bad.program));
+
+  // a program without an events arena has no event arena index
+  auto none = assemble("ARENA scratch 32\nHALT\n");
+  MLVM vm3;
+  CHECK(vm3.loadProgram(none.program));
+  CHECK_EQ(vm3.eventArenaIdx, -1);
+}
+
 } // namespace
 
 int main() {
@@ -215,6 +269,7 @@ int main() {
   testVMArithmetic();
   testVMArenaAndBranch();
   testVMOutOfRangeArenaIsSafe();
+  testLoadK();
 
   if (failures == 0) {
     std::printf("mlvm tests: all passed\n");

@@ -28,7 +28,7 @@ namespace mlvm {
 
 #define MLVM_OPCODES(X) \
   /* system */            X(NOOP) X(HALT) \
-  /* memory access */     X(MOVE) X(LOAD_I) X(LOAD) X(STORE) \
+  /* memory access */     X(MOVE) X(LOAD_I) X(LOAD_K) X(LOAD) X(STORE) \
   /* compare and branch */X(CMP) X(BNE) X(JMP) \
   /* one-input math */    X(SIN) X(LOG) X(EXP) X(NEG) X(ABS) X(RCP) \
   /* two-input math */    X(ADD) X(ADD_WRAP) X(SUB) X(SUB_WRAP) X(MUL) X(DIV) \
@@ -160,10 +160,24 @@ struct MLVM {
   static constexpr size_t kInputRegisterBase{0};
   static constexpr size_t kOutputRegisterBase{kMaxInputs};
 
+  // Event arena: control-rate voice data from the host, one chunk per (channel, row).
+  // A chunk is one ml::ControlRow: 16 ml::ControlBlocks of 4 floats each, 64 floats.
+  // Chunk index = channel * kEventRows + row. A program opts in by declaring
+  // "ARENA events 64" in its manifest; processBlock() then fills it every block and
+  // LOAD_K reads from it. See "Event and control inputs" in the architecture doc.
+  static constexpr size_t kMaxEventChannels{8};
+  static constexpr size_t kEventRows{10};         // == ml::kNumControlRows, checked in mlvm.cpp
+  static constexpr size_t kEventChunkFloats{64};  // == sizeof(ml::ControlRow) / sizeof(float)
+  static constexpr size_t kControlBlockFloats{4}; // == sizeof(ml::ControlBlock) / sizeof(float)
+  static constexpr const char* kEventArenaName{"events"};
+
   std::array< ml::SignalBlock, kNumRegisters > registers;
   std::array< FloatArena, kNumArenas > arenas;
   Program program;
   uint32_t programCounter{0};
+
+  // index of the "events" arena in the loaded program, or -1 if it has none.
+  int eventArenaIdx{-1};
 
   // flag set by CMP, read by BNE. Semantics TBD, see architecture doc.
   bool flag{false};
