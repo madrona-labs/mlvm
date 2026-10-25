@@ -129,7 +129,7 @@ The manifest is the only place buffer sizes appear explicitly — delay times ma
 
 The loader reads the manifest, allocates memory, and begins execution — it does not scan instructions.
 
-To run a program, the client writes input signals including audio and events into the register file. Then the program is run, instruction by instruction until the HALT instruction is reached. Then the client copies the mlvm output registers into its own memory.
+To run a program, the host binds its data (audio input and output buffers, voice controls, controller values) to the program's **external arenas** by name, then runs the program instruction by instruction until HALT. Nothing is copied: the program loads what it needs from the external arenas into registers, computes, and stores results into the audio output arena. The register file is purely the program's working space. See "External arenas" below.
 
 
 ### Registers
@@ -212,16 +212,30 @@ struct VoiceControls { ControlRow rows[kNumControlRows]; };   // one channel, 64
 
 EventsToSignals fills a `VoiceControls` at the end of `makeSignalBlock()` alongside its a-rate outputs, derived from them. The a-rate path stays on during a transition period; later a flag can switch it off, which is where the CPU saving is realized, and the derivation becomes direct.
 
-### The event arena
+### Controllers
 
-Event data is k-rate host data, and the memory model already has a home for that: **params as arena**. One event arena holds all channels. Its chunk size is 16 floats, one ControlRow, and its chunk index is channel × 10 \+ row. 8 channels use 80 of the 256 chunks.
+Each event channel also has 128 continuous controllers. Their values are one float each with no voice dimension, 4KB for 8 channels, and they change only when a controller event arrives. madronalib keeps a `ControllerValues` table (`std::array<float, 128>`) per channel, written on events and never touched per block. Smoothing is the consumer's job, so a program chooses how a controller is interpolated. Channel pressure is not in the table; it is added into the z voice row as before.
 
-| | per voice-row | 1 channel | 8 channels |
+### External arenas
+
+Host data is k-rate (or audio) data the program may or may not read. Copying it into the VM every block would cost bandwidth whether or not it is used, and the amounts add up: 5KB of voice controls, 4KB of controllers, 4KB of audio I/O per block. Instead the manifest declares **external arenas**, and the host binds a pointer to each by name before every block. The data stays where the host wrote it, a program pays exactly for the reads it makes, and the host pays nothing for data no program uses.
+
+```
+EXTERN audioin  64     // one SignalBlock per chunk, chunk = channel (read-only)
+EXTERN audioout 64     // same layout, the only writable external arena
+EXTERN events0  16     // channel 0's VoiceControls: chunk = row (ControlSignals), 16 voices per chunk
+EXTERN ctl0     1      // channel 0's ControllerValues: chunk = controller number
+```
+
+The loader resolves the names once, checks the chunk sizes against the host layouts, and the VM binds pointers by index each block with no lookups. An external arena the host does not provide (an audio input on a context with no inputs, an event channel beyond those configured) is simply unbound: reads from it are no-ops and leave registers untouched. Stores to read-only external arenas are ignored. Only `audioout` is writable.
+
+| host data | per block, 8 channels | copied per block before | now |
 | :---- | :---- | :---- | :---- |
-| a-rate SignalBlock, 9 rows | 64B | 9KB | 72KB |
-| control value, 10 rows | 4B | 640B | 5KB |
+| voice controls, 10 rows × 16 voices | 5KB | yes | bound |
+| controllers, 128 per channel | 4KB | would have been | bound |
+| audio in and out, 8 \+ 8 channels at 64 frames | 4KB | yes | bound |
 
-The boundary between madronalib and mlvm is a copy, once per block in `MLVM::processBlock`, from each channel's `VoiceControls` into the event arena. For 8 channels that is 5KB per block, 15MB/s at a 3kHz block rate. A zero-copy arena that views host memory is possible later if a profile asks for it.
+The per-channel arena shape (`events3/row` rather than one arena indexed by channel × 10 \+ row) falls out of the host's memory: each channel's data is contiguous but the channels are not contiguous with each other. It also reads better. madronalib still knows nothing about arenas; its structs are the arena layouts, pinned by static asserts in mlvm.
 
 Time info (tempo, beat phase, samples since start) takes the same shape in its own chunk. Beat phase needs care because a ramp across the wrap from 0.99 to 0.01 goes the wrong way; the producer can emit an unwrapped end value. Audio inputs remain true a-rate signals in registers.
 
@@ -230,14 +244,16 @@ Time info (tempo, beat phase, samples since start) takes the same shape in its o
 Three stateful operators convert control rows to audio rate. They use the Filters/Gens field layout: dest in field 1, bank size in field 3, the control row's arena and chunk in fields 4,5, and a state chunk in fields 6,7. State is one float per voice (two for LOAD\_KS), declared by the program like any other state.
 
 ```
-LOAD_G   r1, events/gate,  kstate/0     // gate codes -> 0/1 block. state: gate level
-LOAD_KS  r2, r1, events/pitch, kstate/1 // sample and hold: hold the previous value until the
-                                        // gate in src1 rises, then step. state: value + gate level
-LOAD_K   r3, events/bend,  kstate/2     // ramp from the previous value, landing on the new one
-                                        // at the last frame. state: value
+LOAD_G   r1, events0/gate,  kstate/0     // gate codes -> 0/1 block. state: gate level
+LOAD_KS  r2, r1, events0/pitch, kstate/1 // sample and hold: hold the previous value until the
+                                         // gate in src1 rises, then step. state: value + gate level
+LOAD_K   r3, events0/bend,  kstate/2     // ramp from the previous value. state: value
+LOAD_K   r4, ctl0/1,  kstate/3           // a controller is a one-float row: same operator
 ```
 
-LOAD\_KS is the one that makes notes sample accurate: velocity, pitch, elapsed time and voice number all change exactly at the onset frame, because the producer guarantees the cv for a block pairs with the gate rise in that block. Between onsets LOAD\_KS ramps like LOAD\_K, so a gliding or bent pitch stays smooth; for rows that only change at onsets the two behaviours are identical. A program that does not care about onset accuracy can use LOAD\_K alone and accept a one-block ramp at note-on.
+LOAD\_KS is the one that makes notes sample accurate: velocity, pitch, elapsed time and voice number all change exactly at the onset frame, because the producer guarantees the cv for a block pairs with the gate rise in that block. Between onsets LOAD\_KS ramps like LOAD\_K, so a gliding or bent pitch stays smooth; for rows that only change at onsets the two behaviours are identical. A program that does not care about onset accuracy can use LOAD\_K alone and accept a short ramp at note-on.
+
+**Ramps are 16 frames long regardless of the block size.** LOAD\_K and LOAD\_KS ramp over `kControlRampFrames` frames (16, clamped to the block if it is shorter) and then hold, rather than ramping over the whole block. A program therefore sounds the same at block size 16, 64 or 256. This sets the pattern for every operator that depends on time: express it in frames or seconds, never in blocks. The choice of interpolation (linear now; a glide operator with a variable time, or other curves, later) belongs to the VM, which keeps madronalib general-purpose.
 
 Banking is what keeps programs short. One instruction converts one row for all voices, so a 16-voice synth using gate, pitch and velocity needs three instructions, not 48. A synth converts only the rows it uses, and the VM only does conversion work for rows that are read. The frame and lane arrangement for a bank follows the bank layout; the operators' definitions do not depend on it.
 
@@ -295,9 +311,11 @@ Done (Oct 2026): opcode list, assembler, VM instruction loop with tests. Impleme
 
 The next task is **event inputs**, per "Event and control inputs" above. It spans madronalib and mlvm, with the a-rate path left on throughout:
 
-1. madronalib (branch `control-blocks`, v2 done): `ControlSignals`, `ControlRow`, `VoiceControls`, gate transition helpers; EventsToSignals fills a `VoiceControls` at the end of `makeSignalBlock()` alongside its a-rate outputs; AudioContext exposes it per channel  
-2. mlvm (branch `event-inputs`, v2 done): the `events` arena, the per-block copy in `processBlock`, LOAD\_K, LOAD\_KS and LOAD\_G with per-voice state, tests that drive the VM across several blocks  
-3. Example: a bank of oscillators whose pitch comes from LOAD\_KS and whose envelope is gated by LOAD\_G (needs SAW and an envelope)  
+1. madronalib (branch `control-blocks`, done): `ControlSignals`, `ControlRow`, `VoiceControls`, `ControllerValues`, gate transition helpers; EventsToSignals fills them alongside its a-rate outputs; AudioContext exposes them per channel  
+2. mlvm (branch `event-inputs`, done): `EXTERN` arenas bound from the context each block (audio I/O, `events<c>`, `ctl<c>`), LOAD\_K, LOAD\_KS and LOAD\_G with per-voice state and 16-frame ramps, tests that drive the VM across several blocks through bound buffers  
+3. A glide operator with a variable time for controllers and other continuous values  
+4. Time info (tempo, beat phase, samples since start) as an external arena  
+5. Example: a bank of oscillators whose pitch comes from LOAD\_KS and whose envelope is gated by LOAD\_G (needs SAW and an envelope)  
 
 After that: stateful operator state layouts (SAW, SVF), bank inner loops, time info chunk.
 
@@ -317,6 +335,9 @@ After that: stateful operator state layouts (SAW, SVF), bank inner loops, time i
 - **Gate is a signed transition offset, not a frame mask**: `0` none, `±(k+1)` rise/fall at frame k. Block-size agnostic. A 16-bit frame mask was exact and allowed many edges per block but only because 16 frames fit a float mantissa.  
 - **Gate and velocity are separate k-rate rows**: the one place sample-accurate timing and a full-resolution value coincided, split so each is one float. The a-rate gate × velocity row is unchanged.  
 - **One transition per block**: the producer encodes the first edge and tracks the consumer's level so the next block corrects at frame 0. Event rate limit is sr/(2 × block size).  
+- **Host data is bound, not copied**: `EXTERN` arenas for audio I/O, voice controls and controllers, one per channel, bound by name each block. The copies were cheap (about 1% of a block on the design-floor platform) but a bound pointer costs nothing for data a program does not read, lets the producer update controllers only on events, and makes host input one mechanism. Registers are now purely program scratch.  
+- **128 controllers per channel, raw values, VM interpolates**: smoothing moves from the producer to the consumer so a program chooses it. Channel pressure stays in the z voice row.  
+- **16-frame control ramps**: time in frames, never in blocks, so programs are block-size independent.  
 - **madronalib owns ControlBlock, mlvm owns the arena mapping**: madronalib exports plain data with a documented layout and never learns about arenas. The boundary is one memcpy per block.  
 - **Opcodes declared once**: an X-macro list generates the enum and the mnemonic table, so the assembler can never fall out of sync with the VM.
 

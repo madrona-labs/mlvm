@@ -45,9 +45,10 @@ struct ContextLogger
         std::cout << "phase:" << timeInfo.quarterNotesPhase_[0] << "\n";
         std::cout << "samples since start:" << timeInfo.samplesSinceStart << "\n";
         std::cout << "output 0-0:" << context->outputs[0][0] << "\n";
-        // r1 is voice 0's gate and r2 its pitch: play MIDI notes and watch them follow.
+        // r1 is voice 0's gate, r2 its pitch, r3 the mod wheel: play and watch them follow.
         std::cout << "voice 0 gate (r1):" << vm->registers[1][0]
-                  << " pitch (r2):" << vm->registers[2][0] << "\n";
+                  << " pitch (r2):" << vm->registers[2][0]
+                  << " mod wheel (r3):" << vm->registers[3][kFramesPerBlock - 1] << "\n";
         std::this_thread::sleep_for(std::chrono::milliseconds(1000));
       }
     });
@@ -95,19 +96,25 @@ int main( int argc, char *argv[] )
   // but right now we can use the assembler to write a
   // program that is like a single module.
   // Outputs are read from registers starting at kOutputRegisterBase.
-  // The "events" arena receives control-rate voice data from the host every block,
-  // one chunk per row (see ml::ControlSignals): chunk 0 is pitch, chunk 1 is the gate.
+  // The host provides its data as external arenas, bound by name every block; the
+  // program reads only what it declares. events0 holds channel 0's voice rows (see
+  // ml::ControlSignals: chunk 0 pitch, chunk 1 gate), ctl0 its 128 controller values.
   // LOAD_G expands voice 0's gate to r1; LOAD_KS steps voice 0's pitch into r2 at the
-  // gate's rise. Oscillators are still stubs, so the outputs stay silent for now.
-  const char* testCode = R"(
-    ARENA events 16
-    ARENA kstate 32
+  // gate's rise; LOAD_K ramps the mod wheel into r3. Oscillators are still stubs, so
+  // the outputs just pass the (absent) audio input through: silence.
+  const std::string testCode =
+    "EXTERN audioin " + std::to_string(kFramesPerBlock) + "\n"
+    "EXTERN audioout " + std::to_string(kFramesPerBlock) + "\n" + R"(
+    EXTERN events0 16
+    EXTERN ctl0 1
+    ARENA  kstate 32
 
-    LOAD_G  r1, events/1, kstate/0        // voice 0 gate, 0/1 audio rate
-    LOAD_KS r2, r1, events/0, kstate/1    // voice 0 pitch, stepping at note onsets
-    LOAD_I  r3, 0.0f
-    MUL     r8, r2, r3                    // output 0: silence
-    MOVE    r9, r8                        // output 1
+    LOAD_G  r1, events0/1, kstate/0        // voice 0 gate, 0/1 audio rate
+    LOAD_KS r2, r1, events0/0, kstate/1    // voice 0 pitch, stepping at note onsets
+    LOAD_K  r3, ctl0/1, kstate/2           // mod wheel, ramped
+    LOAD    r4, audioin/0
+    STORE   r4, audioout/0
+    STORE   r4, audioout/1
     HALT
   )";
 

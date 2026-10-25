@@ -6,6 +6,7 @@
 // Syntax (see design/mlvm_architecture.md):
 //
 //   ARENA svf-params 5          // manifest: name, chunk size in floats; index = declaration order
+//   EXTERN audioin 64           // manifest: an arena the host binds by name before each block
 //   loop:                       // label, alone on a line or before an instruction
 //   SVF.4 r2, r1, svf-params/3, svf-states/3   // ".N" suffix is the bank size, default 0
 //   LOAD_I r12, 42.333f         // float immediate: contains '.' or ends in 'f'

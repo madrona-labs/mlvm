@@ -13,51 +13,121 @@ using namespace ml;
 
 namespace mlvm {
 
-// the event arena mirrors madronalib's control-rate layout exactly.
+// the external arenas mirror madronalib's layouts exactly.
 static_assert(MLVM::kEventRows == ml::kNumControlRows, "event arena rows must match VoiceControls");
 static_assert(MLVM::kEventVoices == ml::kNumControlVoices, "event arena voices must match ControlRow");
 static_assert(MLVM::kEventChunkFloats * sizeof(float) == sizeof(ml::ControlRow), "event chunk must be one ControlRow");
 static_assert(sizeof(ml::VoiceControls) == MLVM::kEventRows * MLVM::kEventChunkFloats * sizeof(float),
               "one channel of VoiceControls must fill kEventRows consecutive chunks");
+static_assert(MLVM::kNumControllers == ml::kNumControllerValues, "controller arena must match ControllerValues");
+static_assert(sizeof(ml::ControllerValues) == MLVM::kNumControllers * sizeof(float), "ControllerValues must be packed");
+static_assert(sizeof(ml::SignalBlock) == kFramesPerBlock * sizeof(float),
+              "audio arenas assume SignalBlocks are packed in the context's buffers");
 
-// allocate arena memory as described in the manifest and store the program.
+namespace {
+
+// parse a decimal channel suffix: "events3" -> 3. Returns false if malformed.
+bool parseChannelSuffix(std::string_view s, size_t prefixLen, uint8_t& channel) {
+  std::string_view digits = s.substr(prefixLen);
+  if (digits.empty() || digits.size() > 3) return false;
+  unsigned v = 0;
+  for (char c : digits) {
+    if (c < '0' || c > '9') return false;
+    v = v * 10 + static_cast<unsigned>(c - '0');
+  }
+  if (v > 255) return false;
+  channel = static_cast<uint8_t>(v);
+  return true;
+}
+
+// map an EXTERN manifest name to a host input, and the chunk size that input has.
+bool resolveExternal(std::string_view name, MLVM::HostInput& kind, uint8_t& channel, size_t& chunkSize) {
+  channel = 0;
+  if (name == "audioin") { kind = MLVM::HostInput::audioIn; chunkSize = kFramesPerBlock; return true; }
+  if (name == "audioout") { kind = MLVM::HostInput::audioOut; chunkSize = kFramesPerBlock; return true; }
+  constexpr std::string_view kEvents = "events";
+  constexpr std::string_view kCtl = "ctl";
+  if (name.substr(0, kEvents.size()) == kEvents && parseChannelSuffix(name, kEvents.size(), channel)) {
+    kind = MLVM::HostInput::events; chunkSize = MLVM::kEventChunkFloats; return true;
+  }
+  if (name.substr(0, kCtl.size()) == kCtl && parseChannelSuffix(name, kCtl.size(), channel)) {
+    kind = MLVM::HostInput::controllers; chunkSize = 1; return true;
+  }
+  return false;
+}
+
+// ramp from `from` to `to` over kControlRampFrames frames, landing on `to` at the last
+// ramp frame and holding it for the rest of the block. Block-size independent.
+inline SignalBlock controlRamp(float from, float to) {
+  constexpr size_t n = std::min(MLVM::kControlRampFrames, kFramesPerBlock);
+  SignalBlock out(to);
+  const float interval = (to - from) / static_cast<float>(n);
+  for (size_t i = 0; i < n; ++i) out[i] = from + interval * static_cast<float>(i + 1);
+  return out;
+}
+
+} // anonymous namespace
+
+// allocate arena memory as described in the manifest, resolve external arenas, and
+// store the program.
 bool MLVM::loadProgram(const Program& newProgram) {
   if (newProgram.manifest.size() > kNumArenas) return false;
 
-  // the event arena, if declared, must have the ControlRow chunk size.
-  int newEventArenaIdx = -1;
+  // resolve external names first so a bad program leaves the VM untouched.
+  std::vector<ExternalBinding> newExternals;
   for (size_t i = 0; i < newProgram.manifest.size(); ++i) {
-    if (newProgram.manifest[i].name == kEventArenaName) {
-      if (newProgram.manifest[i].chunkSizeInFloats != kEventChunkFloats) return false;
-      newEventArenaIdx = static_cast<int>(i);
-    }
+    const auto& desc = newProgram.manifest[i];
+    if (!desc.external) continue;
+    HostInput kind;
+    uint8_t channel;
+    size_t chunkSize;
+    if (!resolveExternal(desc.name, kind, channel, chunkSize)) return false;
+    if (desc.chunkSizeInFloats != chunkSize) return false;
+    newExternals.push_back({static_cast<uint8_t>(i), kind, channel});
   }
 
   for (auto& a : arenas) a.clear();
   for (size_t i = 0; i < newProgram.manifest.size(); ++i) {
     const auto& desc = newProgram.manifest[i];
-    arenas[i].chunkSizeInFloats = desc.chunkSizeInFloats;
-    arenas[i].floatVec.assign(kChunksPerArena * desc.chunkSizeInFloats, 0.f);
+    if (desc.external) {
+      arenas[i].declareExternal(desc.chunkSizeInFloats);
+    } else {
+      arenas[i].allocate(desc.chunkSizeInFloats, kChunksPerArena);
+    }
   }
 
   program = newProgram;
-  eventArenaIdx = newEventArenaIdx;
+  externals = std::move(newExternals);
   programCounter = 0;
   flag = false;
   return true;
+}
+
+bool MLVM::bindArena(uint8_t arenaIdx, float* data, size_t nFloats, bool writable) {
+  FloatArena& a = arenas[arenaIdx];
+  if (!a.external) return false;
+  a.bind(data, nFloats, writable);
+  return true;
+}
+
+void MLVM::unbindArenas() {
+  for (const auto& b : externals) arenas[b.arena].unbind();
 }
 
 // A float is the smallest thing in an arena, so arena chunk size 1 means 4 bytes.
 // Arena instructions have a bank size operand: a bank of N copies occupies N chunks,
 // so the chunk stride is multiplied by the bank size (bank size 0 means one copy).
 // Returns nullptr if floatsNeeded floats from the addressed chunk are not fully inside
-// the arena, so a bad program cannot read or write outside VM memory.
+// the arena, so a bad program cannot read or write outside VM memory. An unbound
+// external arena has size 0 and so always returns nullptr.
 float* MLVM::getArenaPtr(uint8_t arenaIdx, uint8_t chunk, uint8_t bankSize, size_t floatsNeeded) {
   FloatArena& a = arenas[arenaIdx];
+  float* base = a.data();
+  if (!base) return nullptr;
   size_t copies = bankSize ? bankSize : 1;
   size_t offset = chunk * a.chunkSizeInFloats * copies;
-  if (offset + floatsNeeded > a.floatVec.size()) return nullptr;
-  return a.floatVec.data() + offset;
+  if (offset + floatsNeeded > a.size()) return nullptr;
+  return base + offset;
 }
 
 // Here is the innermost loop that interprets the bytecode program.
@@ -102,22 +172,36 @@ void MLVM::run() {
       case LOAD_I:
         registers[b1] = SignalBlock(getFloatImmediate(inst));
         break;
+      case LOAD:
+        if (const float* src = getArenaPtr(b4, b5, b3, kFramesPerBlock)) {
+          std::memcpy(registers[b1].data(), src, sizeof(SignalBlock));
+        }
+        break;
+      case STORE:
+        // the register operand is still field 1; the arena ref is the destination.
+        // Read-only external arenas (everything but audio output) ignore stores.
+        if (!arenas[b4].writable) break;
+        if (float* dest = getArenaPtr(b4, b5, b3, kFramesPerBlock)) {
+          std::memcpy(dest, registers[b1].data(), sizeof(SignalBlock));
+        }
+        break;
+
       // ---- control rate
-      // These read one ml::ControlRow chunk (one float per voice) from fields 4,5 and
-      // keep per-voice state in the chunk at fields 6,7. Bank size 0 handles voice 0
-      // into dest; bank size N handles voices 0..N-1 into dest..dest+N-1, one voice per
-      // register, horizontal. One chunk holds all voices, so no bank stride on the
-      // arena pointers.
+      // These read one ml::ControlRow chunk (one float per voice) or one controller
+      // value from fields 4,5 and keep per-voice state in the chunk at fields 6,7.
+      // Bank size 0 handles voice 0 into dest; bank size N handles voices 0..N-1 into
+      // dest..dest+N-1, one voice per register, horizontal. One chunk holds all
+      // voices, so no bank stride on the arena pointers.
       // TODO: replace the banked case with the vertical 4x4 layout once the bank
       // layout TODO in the architecture doc is resolved.
       case LOAD_K: {
-        // ramp from the previous value to the control value, landing on it at the last frame.
-        const float* cv = getArenaPtr(b4, b5, 0, kEventVoices);
-        float* state = getArenaPtr(b6, b7, 0, kEventVoices);
-        if (!cv || !state) break;
+        // ramp from the previous value to the control value over kControlRampFrames.
         const size_t nVoices = std::min<size_t>(b3 ? b3 : 1, kEventVoices);
+        const float* cv = getArenaPtr(b4, b5, 0, nVoices);
+        float* state = getArenaPtr(b6, b7, 0, nVoices);
+        if (!cv || !state) break;
         for (size_t v = 0; v < nVoices && (b1 + v) < kNumRegisters; ++v) {
-          registers[b1 + v] = interpolateBlockLinear(state[v], cv[v]);
+          registers[b1 + v] = controlRamp(state[v], cv[v]);
           state[v] = cv[v];
         }
         break;
@@ -128,11 +212,11 @@ void MLVM::run() {
         // step to the control value. With no rise in the block, ramp like LOAD_K so
         // continuous values (pitch under glide or bend) stay smooth.
         // State chunk: [0, 16) previous values, [16, 32) previous gate levels.
-        const float* cv = getArenaPtr(b4, b5, 0, kEventVoices);
-        float* state = getArenaPtr(b6, b7, 0, 2 * kEventVoices);
-        if (!cv || !state || arenas[b6].chunkSizeInFloats < 2 * kEventVoices) break;
-        float* prevGate = state + kEventVoices;
         const size_t nVoices = std::min<size_t>(b3 ? b3 : 1, kEventVoices);
+        const float* cv = getArenaPtr(b4, b5, 0, nVoices);
+        float* state = getArenaPtr(b6, b7, 0, kEventVoices + nVoices);
+        if (!cv || !state) break;
+        float* prevGate = state + kEventVoices;
         for (size_t v = 0; v < nVoices && (b1 + v) < kNumRegisters && (b2 + v) < kNumRegisters; ++v) {
           const SignalBlock& gate = registers[b2 + v];
           bool prev = prevGate[v] > 0.5f;
@@ -147,7 +231,7 @@ void MLVM::run() {
             for (int i = 0; i < rise; ++i) out[i] = state[v];
             registers[b1 + v] = out;
           } else {
-            registers[b1 + v] = interpolateBlockLinear(state[v], cv[v]);
+            registers[b1 + v] = controlRamp(state[v], cv[v]);
           }
           state[v] = cv[v];
           prevGate[v] = gate[kFramesPerBlock - 1] > 0.5f ? 1.f : 0.f;
@@ -156,27 +240,16 @@ void MLVM::run() {
       }
       case LOAD_G: {
         // expand gate transition codes (see MLDSPOps.h) to 0/1 blocks. State: gate level.
-        const float* codes = getArenaPtr(b4, b5, 0, kEventVoices);
-        float* level = getArenaPtr(b6, b7, 0, kEventVoices);
-        if (!codes || !level) break;
         const size_t nVoices = std::min<size_t>(b3 ? b3 : 1, kEventVoices);
+        const float* codes = getArenaPtr(b4, b5, 0, nVoices);
+        float* level = getArenaPtr(b6, b7, 0, nVoices);
+        if (!codes || !level) break;
         for (size_t v = 0; v < nVoices && (b1 + v) < kNumRegisters; ++v) {
           const bool after = expandGate(codes[v], level[v] > 0.5f, registers[b1 + v]);
           level[v] = after ? 1.f : 0.f;
         }
         break;
       }
-      case LOAD:
-        if (float* src = getArenaPtr(b4, b5, b3, kFramesPerBlock)) {
-          std::memcpy(registers[b1].data(), src, sizeof(SignalBlock));
-        }
-        break;
-      case STORE:
-        // the register operand is still field 1; the arena ref is the destination.
-        if (float* dest = getArenaPtr(b4, b5, b3, kFramesPerBlock)) {
-          std::memcpy(dest, registers[b1].data(), sizeof(SignalBlock));
-        }
-        break;
 
       // ---- compare and branch
       // TODO: semantics TBD (ALL / ANY / threshold, flag count). For now CMP sets
@@ -248,37 +321,44 @@ void MLVM::run() {
   }
 }
 
-// Copy audio inputs from the AudioContext into our input registers, run the
-// program, and copy output registers back to the context. We implement decisions
-// here about maximum numbers of inputs/outputs/event signals that are not
-// limitations of the AudioContext.
+// Bind the program's external arenas to the context's memory, run the program, and
+// unbind. Nothing is copied: a program pays only for the host data it reads. The
+// context has finished event processing for this block before calling us, so the
+// voice controls and controller values are stable while we run.
 void MLVM::processBlock(AudioContext* context) {
-  const size_t nInputs = std::min<size_t>(context->inputs.size(), kMaxInputs);
-  for (size_t i = 0; i < nInputs; ++i) {
-    registers[kInputRegisterBase + i] = context->inputs[static_cast<int>(i)];
-  }
-
-  // copy control-rate event data for each channel into the event arena, if the
-  // program declared one. One channel's VoiceControls fills kEventRows chunks.
-  if (eventArenaIdx >= 0) {
-    FloatArena& events = arenas[eventArenaIdx];
-    const size_t floatsPerChannel = kEventRows * kEventChunkFloats;
-    const size_t nChannels = std::min<size_t>(context->getNumEventChannels(), kMaxEventChannels);
-    for (size_t ch = 0; ch < nChannels; ++ch) {
-      if ((ch + 1) * floatsPerChannel > events.floatVec.size()) break;
-      std::memcpy(events.floatVec.data() + ch * floatsPerChannel,
-                  &context->getInputVoiceControls(static_cast<int>(ch)), sizeof(VoiceControls));
+  for (const auto& b : externals) {
+    switch (b.kind) {
+      case HostInput::audioIn: {
+        const size_t n = context->inputs.size();
+        bindArena(b.arena, n ? context->inputs[0].data() : nullptr, n * kFramesPerBlock, false);
+        break;
+      }
+      case HostInput::audioOut: {
+        const size_t n = context->outputs.size();
+        bindArena(b.arena, n ? context->outputs[0].data() : nullptr, n * kFramesPerBlock, true);
+        break;
+      }
+      case HostInput::events: {
+        if (b.channel < context->getNumEventChannels()) {
+          const VoiceControls& vc = context->getInputVoiceControls(b.channel);
+          bindArena(b.arena, const_cast<float*>(vc.rows[0].data()), sizeof(VoiceControls) / sizeof(float), false);
+        }
+        break;
+      }
+      case HostInput::controllers: {
+        if (b.channel < context->getNumEventChannels()) {
+          const ControllerValues& cv = context->getInputControllerValues(b.channel);
+          bindArena(b.arena, const_cast<float*>(cv.data()), cv.size(), false);
+        }
+        break;
+      }
     }
   }
 
-  // TODO: time info (tempo, beat phase, samples since start) as a control-rate chunk.
+  // TODO: time info (tempo, beat phase, samples since start) as an external arena.
 
   run();
-
-  const size_t nOutputs = std::min<size_t>(context->outputs.size(), kMaxOutputs);
-  for (size_t i = 0; i < nOutputs; ++i) {
-    context->outputs[static_cast<int>(i)] = registers[kOutputRegisterBase + i];
-  }
+  unbindArenas();
 }
 
 } // namespace mlvm

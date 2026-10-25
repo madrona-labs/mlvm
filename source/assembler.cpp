@@ -156,16 +156,19 @@ private:
 
     std::string head = toUpper(tokens[0]);
     if (head == "ARENA") {
-      parseArena(tokens);
+      parseArena(tokens, false);
+    } else if (head == "EXTERN") {
+      parseArena(tokens, true);
     } else {
       parseInstruction(tokens);
     }
   }
 
-  // ARENA name chunkSizeInFloats
-  void parseArena(const std::vector<std::string_view>& tokens) {
+  // ARENA name chunkSizeInFloats    allocated by the VM
+  // EXTERN name chunkSizeInFloats   bound by the host before each block
+  void parseArena(const std::vector<std::string_view>& tokens, bool external) {
     if (tokens.size() != 3) {
-      error("ARENA takes a name and a chunk size in floats");
+      error(std::string(external ? "EXTERN" : "ARENA") + " takes a name and a chunk size in floats");
       return;
     }
     std::string name(tokens[1]);
@@ -187,7 +190,7 @@ private:
       return;
     }
     arenaIndices_[name] = static_cast<uint8_t>(result_.program.manifest.size());
-    result_.program.manifest.push_back({name, chunkSize});
+    result_.program.manifest.push_back({name, chunkSize, external});
   }
 
   // MNEMONIC[.bank] operand, operand, ...
@@ -367,7 +370,7 @@ std::string disassemble(const Program& program) {
   std::ostringstream out;
   for (size_t i = 0; i < program.manifest.size(); ++i) {
     const auto& a = program.manifest[i];
-    out << "ARENA " << a.name << " " << a.chunkSizeInFloats << "   // arena " << i << "\n";
+    out << (a.external ? "EXTERN " : "ARENA ") << a.name << " " << a.chunkSizeInFloats << "   // arena " << i << "\n";
   }
   for (size_t i = 0; i < program.instructions.size(); ++i) {
     const Instruction& inst = program.instructions[i];

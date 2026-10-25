@@ -123,9 +123,14 @@ static inline void setAddressOffset(Instruction& t, int16_t offset) {
 
 // An arena is a flat float buffer addressed by an 8-bit chunk index.
 // Each arena has its own chunk size, declared in the manifest.
+//
+// An arena is either allocated by the VM (ARENA) or external (EXTERN): memory the
+// host binds by name before each block, such as audio I/O, voice controls and
+// controller values. External arenas cost nothing unless the program reads them.
 struct ArenaDescription {
   std::string name;
   uint32_t chunkSizeInFloats{0};
+  bool external{false};
 };
 
 struct Program {
@@ -136,11 +141,49 @@ struct Program {
 // ----------------------------------------------------------------
 // VM
 
+// Storage for one arena: either owned by the VM or a view of host memory.
 struct FloatArena {
-  std::vector< float > floatVec;
+  std::vector< float > owned;
+  float* view{nullptr};
+  size_t viewSize{0};
   size_t chunkSizeInFloats{0};
+  bool external{false};
+  bool writable{true};
 
-  void clear() { floatVec.clear(); chunkSizeInFloats = 0; }
+  float* data() { return external ? view : owned.data(); }
+  const float* data() const { return external ? view : owned.data(); }
+  size_t size() const { return external ? viewSize : owned.size(); }
+
+  void allocate(size_t chunkSize, size_t nChunks) {
+    clear();
+    chunkSizeInFloats = chunkSize;
+    owned.assign(chunkSize * nChunks, 0.f);
+  }
+
+  void declareExternal(size_t chunkSize) {
+    clear();
+    chunkSizeInFloats = chunkSize;
+    external = true;
+    writable = false;
+  }
+
+  // point an external arena at host memory for the duration of a block.
+  void bind(float* p, size_t nFloats, bool isWritable) {
+    view = p;
+    viewSize = p ? nFloats : 0;
+    writable = isWritable;
+  }
+
+  void unbind() { view = nullptr; viewSize = 0; }
+
+  void clear() {
+    owned.clear();
+    view = nullptr;
+    viewSize = 0;
+    chunkSizeInFloats = 0;
+    external = false;
+    writable = true;
+  }
 };
 
 struct MLVM {
@@ -150,41 +193,49 @@ struct MLVM {
   static constexpr size_t kNumArenas{256};
   static constexpr size_t kChunksPerArena{256};
 
-  // we set a maximum number of inputs and outputs so programs
-  // will know where to find inputs in the register file.
-  static constexpr size_t kMaxInputs{8};
-  static constexpr size_t kMaxVoices{8};
-  static constexpr size_t kMaxOutputs{8};
-
-  // processBlock() copies audio inputs into registers starting here, and
-  // copies audio outputs out of registers starting here.
-  static constexpr size_t kInputRegisterBase{0};
-  static constexpr size_t kOutputRegisterBase{kMaxInputs};
-
-  // Event arena: control-rate voice data from the host, one chunk per (channel, row).
-  // A chunk is one ml::ControlRow: one float per voice, 16 floats.
-  // Chunk index = channel * kEventRows + row; rows follow ml::ControlSignals.
-  // A program opts in by declaring "ARENA events 16" in its manifest; processBlock()
-  // then fills it every block and the control-rate operators read from it:
-  //   LOAD_K  dest, events/row, state/chunk          ramp from previous value
-  //   LOAD_KS dest, gateReg, events/row, state/chunk sample and hold at the gate's rise
-  //   LOAD_G  dest, events/gate, state/chunk         expand gate transitions to 0/1
-  // Their state chunks hold one float per voice (LOAD_K, LOAD_G: 16 floats) or two
+  // External arenas the host can provide, by manifest name. A program declares the
+  // ones it uses with "EXTERN name chunksize" and processBlock() binds them from the
+  // AudioContext every block. Reads from an unbound external arena are no-ops, and
+  // only audio output is writable.
+  //
+  //   audioin    chunk = one SignalBlock (kFramesPerBlock floats), chunk index = channel
+  //   audioout   same layout, writable
+  //   events<c>  event channel c's ml::VoiceControls: chunk = one ml::ControlRow (16 floats,
+  //              one per voice), chunk index = row per ml::ControlSignals
+  //   ctl<c>     event channel c's ml::ControllerValues: chunk = one float, chunk index =
+  //              controller number 0..127
+  //
+  // Control-rate operators read these rows and keep per-voice state in a chunk the
+  // program declares:
+  //   LOAD_K  dest, row, state          ramp from the previous value over kControlRampFrames
+  //   LOAD_KS dest, gateReg, row, state sample and hold at the gate's rise, else ramp
+  //   LOAD_G  dest, gateRow, state      expand gate transition codes to 0/1
+  // State chunks hold one float per voice (LOAD_K, LOAD_G: 16 floats) or two
   // (LOAD_KS: 32 floats, previous values then previous gate levels).
   // See "Event and control inputs" in the architecture doc.
-  static constexpr size_t kMaxEventChannels{8};
   static constexpr size_t kEventRows{10};         // == ml::kNumControlRows, checked in mlvm.cpp
   static constexpr size_t kEventVoices{16};       // == ml::kNumControlVoices
-  static constexpr size_t kEventChunkFloats{kEventVoices};  // == sizeof(ml::ControlRow) / sizeof(float)
-  static constexpr const char* kEventArenaName{"events"};
+  static constexpr size_t kEventChunkFloats{kEventVoices};
+  static constexpr size_t kNumControllers{128};   // == ml::kNumControllerValues
+
+  // control-rate values ramp over this many frames regardless of the block size, so
+  // a program sounds the same at any block size. Clamped to the block if it is shorter.
+  static constexpr size_t kControlRampFrames{16};
+
+  enum class HostInput : uint8_t { audioIn, audioOut, events, controllers };
+
+  // an external arena resolved at load time, so processBlock() does no name lookups.
+  struct ExternalBinding {
+    uint8_t arena;
+    HostInput kind;
+    uint8_t channel;
+  };
 
   std::array< ml::SignalBlock, kNumRegisters > registers;
   std::array< FloatArena, kNumArenas > arenas;
+  std::vector< ExternalBinding > externals;
   Program program;
   uint32_t programCounter{0};
-
-  // index of the "events" arena in the loaded program, or -1 if it has none.
-  int eventArenaIdx{-1};
 
   // flag set by CMP, read by BNE. Semantics TBD, see architecture doc.
   bool flag{false};
@@ -202,21 +253,27 @@ struct MLVM {
   //
   // For crossfades on changes and super-quick undo, we can keep 2 versions of the program and state.
 
-  // allocate arenas as described in the program manifest and store the instructions.
+  // allocate arenas as described in the program manifest, resolve external arena
+  // names, and store the instructions. Fails on an unknown external name or a
+  // chunk size that does not match the host data.
   bool loadProgram(const Program& newCode);
+
+  // point an external arena at host memory. Returns false if the arena is not external.
+  bool bindArena(uint8_t arenaIdx, float* data, size_t nFloats, bool writable);
+  void unbindArenas();
 
   // run the loaded program once on the current register file, until HALT.
   // Does not touch any AudioContext, so it can be driven directly by tests.
   void run();
 
   // process in a given context - the context contains audio i/o, event i/o, and time/beats info.
-  // Copies inputs into registers, calls run(), copies output registers back out.
+  // Binds the external arenas, calls run(), unbinds them.
   void processBlock(ml::AudioContext* context);
 
 private:
   // return a float ptr into the arena at the given chunk, or nullptr if floatsNeeded
-  // floats from there would fall outside the arena. The chunk stride is scaled by the
-  // bank size (0 means one copy).
+  // floats from there would fall outside the arena (or the arena is unbound). The
+  // chunk stride is scaled by the bank size (0 means one copy).
   float* getArenaPtr(uint8_t arena, uint8_t chunk, uint8_t bankSize, size_t floatsNeeded);
 };
 
