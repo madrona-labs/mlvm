@@ -184,67 +184,63 @@ It does not fit, and even if it did, the host would generate 1152 a-rate blocks 
 
 A 16-frame block at 48kHz is a 3kHz control rate. Quantizing events to block boundaries adds at most 0.33ms of timing jitter, below MIDI's own jitter. With a linear ramp across each block the steps disappear. So event data can be k-rate with no audible loss, and the sample-accurate placement EventsToSignals does today becomes unnecessary for mlvm.
 
-### ControlBlock: one block of a control-rate signal
+### Control values: one float per voice per row
 
-A **SignalBlock** is one block's worth of an audio-rate signal: 16 floats. A **ControlBlock** is one block's worth of a control-rate signal: one float4 of plain data.
+A **SignalBlock** is one block's worth of an audio-rate signal: 16 floats. A control-rate signal is **one float per block**. Which kind of float it is comes from the row it sits in, so no tag bits are needed anywhere.
 
-```
-struct ControlBlock {
-  float start;    // value at frame 0, or before the step
-  float end;      // value at the last frame, or after the step
-  float offset;   // step frame, 0..15. unused for a ramp
-  float kind;     // 0 = ramp, 1 = step
-};
-```
+- **Value rows** (pitch, velocity, voice, z, x, y, mod, elapsed time, bend) hold the value at the end of the block. A consumer that wants audio rate ramps to it from the previous value it saw, which it keeps as its own state. Interpolation state therefore lives in the consumer, where every other stateful operator already keeps state, and the producer stays stateless.
+- **The gate row** holds at most one transition per block: `0` means no transition, `+(k+1)` rises to high at frame k, `-(k+1)` falls to low at frame k. The offset is a small integer stored exactly in the float, so the encoding does not depend on the block size and will survive a move to 32 or 64 frames. A consumer keeps the gate level as its state.
 
-A **ramp** moves linearly from start to end, landing on end at the last frame so the next block continues without a repeated sample. A **step** holds start for frames before offset and end from offset on, which gives sample-accurate note onsets and gate edges at a rate of one step per row per block. The producer, not the consumer, decides which: a note-on steps every row at the event frame (except a gliding pitch, which ramps), a note-off steps the gate, the voice-number row always steps, and everything else ramps. Because every ControlBlock is a complete description of its block, nothing downstream remembers anything between blocks.
+Gate and velocity are separate rows here. The audio-rate `kGate` row carries gate × velocity for compatibility; splitting them in the k-rate path is what lets the gate be sample accurate in one float. With velocity in the tenth slot there are exactly 10 rows and no reserved row.
 
-All four fields are floats so the struct is exactly one float4, loads in one instruction, and drops into a float arena without reinterpretation. Small integers are exact in float. A two-float (start, end) form with a NaN-boxed step tag was considered and rejected: it saves 8 bytes per voice-row at the cost of a lossy half-float "before" value, a bit-level encoding that breaks `/fp:fast` NaN tests, and a type that other madronalib users could no longer treat as plain floats.
+**Two edges in one block.** A retrigger falls then rises; a very short note rises then falls. The producer encodes the first edge, and tracks the level the consumer now holds. The next block's a-rate gate is constant at the other level, so the producer sees a transition at frame 0 and encodes it. A stolen voice's onset is delayed by less than one block, the cv change lands with the deferred rise, and nothing is lost. This is the sr/(2 × block size) event rate limit, accepted by design.
 
-ControlBlock is defined in madronalib, since it is useful to any synth built on madronalib, not only to mlvm. madronalib does not know about arenas. It exports plain data types with a documented layout:
+The alternatives: v1 used a (start, end) pair per value so the producer could describe ramps with no consumer state, then a four-float (start, end, offset, kind) block for sample-accurate steps. A 16-bit frame mask in the gate float was considered: exact, any number of edges, but it depends on 16 frames fitting a float mantissa and loses resolution if the block grows. A NaN-boxed step tag in a two-float pair was rejected for being lossy and for breaking the plain-float contract for every madronalib user.
+
+madronalib owns the types and knows nothing about arenas:
 
 ```
-// one row (e.g. pitch) for all voices of one channel: row[v] is voice v's ControlBlock.
-using ControlRow = std::array<ControlBlock, kMaxVoices>;        // 64 floats, 256 bytes
-
-// all rows for one channel. The 9 a-rate rows plus one reserved row make 10,
-// a round number that keeps the arena arithmetic easy to follow. The a-rate
-// output count (kNumVoiceOutputRows = 9) is unchanged.
-constexpr size_t kNumControlRows = 10;
-struct VoiceControls { ControlRow rows[kNumControlRows]; };    // 10 rows, 2560 bytes
+enum ControlSignals { kCtlPitch, kCtlGate, kCtlVelocity, kCtlVoice, kCtlZ, kCtlX, kCtlY,
+                      kCtlMod, kCtlElapsedTime, kCtlBend, kNumControlRows };   // 10
+using ControlRow = std::array<float, 16>;              // one row for all voices
+struct VoiceControls { ControlRow rows[kNumControlRows]; };   // one channel, 640 bytes
 ```
 
-EventsToSignals grows a `VoiceControls` output alongside its existing a-rate outputs. The a-rate path stays on during a transition period; later a flag can switch it off, which is where the CPU saving is realized.
+EventsToSignals fills a `VoiceControls` at the end of `makeSignalBlock()` alongside its a-rate outputs, derived from them. The a-rate path stays on during a transition period; later a flag can switch it off, which is where the CPU saving is realized, and the derivation becomes direct.
 
 ### The event arena
 
-Event data is k-rate host data, and the memory model already has a home for that: **params as arena**. One event arena holds all channels. Its chunk size is 64 floats, one ControlRow, and its chunk index is channel × 10 \+ row. 8 channels use 80 of the 256 chunks.
+Event data is k-rate host data, and the memory model already has a home for that: **params as arena**. One event arena holds all channels. Its chunk size is 16 floats, one ControlRow, and its chunk index is channel × 10 \+ row. 8 channels use 80 of the 256 chunks.
 
 | | per voice-row | 1 channel | 8 channels |
 | :---- | :---- | :---- | :---- |
 | a-rate SignalBlock, 9 rows | 64B | 9KB | 72KB |
-| ControlBlock, 10 rows | 16B | 2.5KB | 20KB |
+| control value, 10 rows | 4B | 640B | 5KB |
 
-The boundary between madronalib and mlvm is a copy, once per block in `MLVM::processBlock`, from each channel's `VoiceControls` into the event arena. For 8 channels that is 20KB per block, 60MB/s at a 3kHz block rate, about a microsecond of a 333µs block. A zero-copy arena that views host memory is possible later if a profile asks for it.
+The boundary between madronalib and mlvm is a copy, once per block in `MLVM::processBlock`, from each channel's `VoiceControls` into the event arena. For 8 channels that is 5KB per block, 15MB/s at a 3kHz block rate. A zero-copy arena that views host memory is possible later if a profile asks for it.
 
 Time info (tempo, beat phase, samples since start) takes the same shape in its own chunk. Beat phase needs care because a ramp across the wrap from 0.99 to 0.01 goes the wrong way; the producer can emit an unwrapped end value. Audio inputs remain true a-rate signals in registers.
 
-### LOAD\_K: k-rate to a-rate
+### Control-rate operators
 
-One opcode in the memory access category converts a ControlRow chunk into a-rate registers:
-
-```
-LOAD_K.4  r16, events/pitch      // dest: field 1, bank size: field 3, arena/chunk: fields 4,5
-```
-
-For each voice in the bank, LOAD\_K expands the voice's ControlBlock: a ramp fills the frames linearly from start to end, a step holds start until the offset frame and end after it. The frame and lane arrangement follows the bank layout; LOAD\_K's definition does not depend on it. The producer decided ramp versus step, so LOAD\_K needs no per-row knowledge.
-
-Banking is what keeps programs short. One LOAD\_K converts one signal for all voices, so a 16-voice synth using pitch, gate and mod needs three conversion instructions, not 48. A synth converts only the rows it uses, and the VM only does conversion work for rows that are read.
+Three stateful operators convert control rows to audio rate. They use the Filters/Gens field layout: dest in field 1, bank size in field 3, the control row's arena and chunk in fields 4,5, and a state chunk in fields 6,7. State is one float per voice (two for LOAD\_KS), declared by the program like any other state.
 
 ```
-LOAD_K.4  r16, events/pitch
-LOAD_K.4  r20, events/gate
-SAW.4     r24, r16, saw-params/0, saw-states/0
+LOAD_G   r1, events/gate,  kstate/0     // gate codes -> 0/1 block. state: gate level
+LOAD_KS  r2, r1, events/pitch, kstate/1 // sample and hold: hold the previous value until the
+                                        // gate in src1 rises, then step. state: value + gate level
+LOAD_K   r3, events/bend,  kstate/2     // ramp from the previous value, landing on the new one
+                                        // at the last frame. state: value
+```
+
+LOAD\_KS is the one that makes notes sample accurate: velocity, pitch, elapsed time and voice number all change exactly at the onset frame, because the producer guarantees the cv for a block pairs with the gate rise in that block. Between onsets LOAD\_KS ramps like LOAD\_K, so a gliding or bent pitch stays smooth; for rows that only change at onsets the two behaviours are identical. A program that does not care about onset accuracy can use LOAD\_K alone and accept a one-block ramp at note-on.
+
+Banking is what keeps programs short. One instruction converts one row for all voices, so a 16-voice synth using gate, pitch and velocity needs three instructions, not 48. A synth converts only the rows it uses, and the VM only does conversion work for rows that are read. The frame and lane arrangement for a bank follows the bank layout; the operators' definitions do not depend on it.
+
+```
+LOAD_G.4   r16, events/gate,  kstate/0
+LOAD_KS.4  r20, r16, events/pitch, kstate/1
+SAW.4      r24, r20, saw-params/0, saw-states/0
 ```
 
 Stateful operators already carry params arena and chunk fields, so an operator designed for it can read a k-rate parameter directly from the event arena with no conversion when a-rate modulation of that input is not needed. This is optional and does not change the main path.
@@ -295,9 +291,9 @@ Done (Oct 2026): opcode list, assembler, VM instruction loop with tests. Impleme
 
 The next task is **event inputs**, per "Event and control inputs" above. It spans madronalib and mlvm, with the a-rate path left on throughout:
 
-1. madronalib (branch `control-blocks`, done): `ControlBlock`, `ControlRow`, `VoiceControls`; EventsToSignals fills a `VoiceControls` at the end of `makeSignalBlock()` alongside its a-rate outputs; AudioContext exposes it per channel  
-2. mlvm (branch `event-inputs`, done): the `events` arena, the per-block copy in `processBlock`, LOAD\_K with scalar ramp and step, tests that drive the VM with hand-built ControlBlocks  
-3. Example: a bank of oscillators whose pitch comes from LOAD\_K (needs SAW)  
+1. madronalib (branch `control-blocks`, v2 done): `ControlSignals`, `ControlRow`, `VoiceControls`, gate transition helpers; EventsToSignals fills a `VoiceControls` at the end of `makeSignalBlock()` alongside its a-rate outputs; AudioContext exposes it per channel  
+2. mlvm (branch `event-inputs`, v2 done): the `events` arena, the per-block copy in `processBlock`, LOAD\_K, LOAD\_KS and LOAD\_G with per-voice state, tests that drive the VM across several blocks  
+3. Example: a bank of oscillators whose pitch comes from LOAD\_KS and whose envelope is gated by LOAD\_G (needs SAW and an envelope)  
 
 After that: stateful operator state layouts (SAW, SVF), bank inner loops, time info chunk.
 
@@ -312,8 +308,11 @@ After that: stateful operator state layouts (SAW, SVF), bank inner loops, time i
 - **Manifest for arena sizes only**: all other object counts inferred at compile time by the compiler, not by scanning instructions at load time  
 - **Params as arena**: k-rate control values from host live in a params arena, written before each block, read by operators via params arena+chunk fields  
 - **Bank size 0 \= one horizontal copy**: clean encoding, the only special case  
-- **Events are k-rate ControlBlocks in one event arena**: one float4 (start, end, offset, kind) per voice per row; the producer decides ramp vs. step and steps are sample accurate; LOAD\_K converts to a-rate. 72KB of a-rate signals becomes 20KB of ControlBlocks. See "Event and control inputs."  
-- **ControlBlock is four plain floats, not a NaN-boxed pair**: 10KB more per 8 channels buys a lossless, debuggable type that stays general-purpose for every madronalib user.  
+- **Events are one float per voice per row in one event arena**: value rows hold the block-end value, the gate row holds a signed transition offset. 72KB of a-rate signals becomes 5KB. See "Event and control inputs."  
+- **Interpolation state lives in the consumer**: LOAD\_K, LOAD\_KS and LOAD\_G keep per-voice state like every other stateful operator, so the producer is stateless and a value is a single float. (v1 put [start, end] pairs and then four-float ramp/step blocks in the data instead; both worked, both were bigger than needed.)  
+- **Gate is a signed transition offset, not a frame mask**: `0` none, `±(k+1)` rise/fall at frame k. Block-size agnostic. A 16-bit frame mask was exact and allowed many edges per block but only because 16 frames fit a float mantissa.  
+- **Gate and velocity are separate k-rate rows**: the one place sample-accurate timing and a full-resolution value coincided, split so each is one float. The a-rate gate × velocity row is unchanged.  
+- **One transition per block**: the producer encodes the first edge and tracks the consumer's level so the next block corrects at frame 0. Event rate limit is sr/(2 × block size).  
 - **madronalib owns ControlBlock, mlvm owns the arena mapping**: madronalib exports plain data with a documented layout and never learns about arenas. The boundary is one memcpy per block.  
 - **Opcodes declared once**: an X-macro list generates the enum and the mnemonic table, so the assembler can never fall out of sync with the VM.
 
@@ -322,7 +321,8 @@ After that: stateful operator state layouts (SAW, SVF), bank inner loops, time i
 
 - Compare and branch semantics: exact conditions (ALL, ANY, threshold?), flag register count. CMP has sources but no dest, so the assembler's generic register placement currently puts src1 in field 1 rather than field 2. Resolve together with the semantics, either by giving CMP a dest (flag in a register) or by adding a per-opcode operand format column to the opcode list.  
 - When to turn off a-rate event signal generation in EventsToSignals once mlvm no longer reads it  
-- A note-on and note-off in the same block: only one step per row per block is representable, so the gate reaches zero in the next block. Fine for MIDI; revisit if a second step per block is ever needed.  
+- Vertical 4x4 bank layout for the control-rate operators; they are one voice per register until the bank layout is settled  
+- Time info (tempo, beat phase, samples since start) as control rows in their own chunk; beat phase needs an unwrapped end value so a ramp across the wrap goes the right way  
 - Projection type encoding: list of 256 projection functions TBD  
 - Whether JIT compilation is in scope (not planned for v0.2)  
 - Exact binary file format (magic number, version, endianness)  

@@ -207,45 +207,88 @@ void testVMOutOfRangeArenaIsSafe() {
   CHECK(vm.registers[2][0] == 0.f);
 }
 
-void testLoadK() {
+void testControlRate() {
   using namespace mlvm;
+  using ml::kFramesPerBlock;
+  const size_t last = kFramesPerBlock - 1;
+
+  // rows follow ml::ControlSignals: 0 pitch, 1 gate, 9 bend. kstate chunks: 0 gate
+  // level, 1 sample-and-hold (32 floats), 2 ramp state.
   auto r = assemble(R"(
-    ARENA events 64          // one ml::ControlRow per chunk: 16 voices x 4 floats
-    LOAD_K   r1, events/0    // voice 0 of row 0
-    LOAD_K.3 r4, events/3    // voices 0, 1, 2 of row 3 into r4, r5, r6
+    ARENA events 16
+    ARENA kstate 32
+    LOAD_G  r1, events/1, kstate/0        // gate -> 0/1 block
+    LOAD_KS r2, r1, events/0, kstate/1    // pitch, stepping at the gate's rise
+    LOAD_K  r3, events/9, kstate/2        // bend, ramped
     HALT
   )");
   if (!r.ok()) printErrors(r);
   CHECK(r.ok());
-  if (r.program.instructions.size() != 3) { ++failures; return; }
+  if (r.program.instructions.size() != 4) { ++failures; return; }
   const auto& code = r.program.instructions;
-  CHECK((code[0] == Instruction{LOAD_K, 1, 0, 0, 0, 0, 0, 0}));
-  CHECK((code[1] == Instruction{LOAD_K, 4, 0, 3, 0, 3, 0, 0}));
+  CHECK((code[0] == Instruction{LOAD_G, 1, 0, 0, 0, 1, 1, 0}));
+  CHECK((code[1] == Instruction{LOAD_KS, 2, 1, 0, 0, 0, 1, 1}));
+  CHECK((code[2] == Instruction{LOAD_K, 3, 0, 0, 0, 9, 1, 2}));
 
   MLVM vm;
   CHECK(vm.loadProgram(r.program));
   CHECK_EQ(vm.eventArenaIdx, 0);
-  CHECK_EQ(vm.arenas[0].floatVec.size(), 256u * 64u);
+  CHECK_EQ(vm.arenas[0].floatVec.size(), 256u * 16u);
 
-  // write ControlBlocks straight into the arena, as processBlock would.
-  auto writeBlock = [&](size_t row, size_t voice, ml::ControlBlock c) {
-    std::memcpy(vm.arenas[0].floatVec.data() + row * 64 + voice * 4, &c, sizeof(c));
+  auto set = [&](size_t row, size_t voice, float value) { vm.arenas[0].floatVec[row * 16 + voice] = value; };
+  auto allEqual = [&](size_t reg, float value) {
+    for (size_t i = 0; i < kFramesPerBlock; ++i) if (vm.registers[reg][i] != value) return false;
+    return true;
   };
-  writeBlock(0, 0, ml::ControlBlock::ramp(0.f, 1.f));
-  writeBlock(3, 0, ml::ControlBlock::ramp(2.f, 2.f));     // flat
-  writeBlock(3, 1, ml::ControlBlock::ramp(-1.f, 0.f));
-  writeBlock(3, 2, ml::ControlBlock::step(-1.f, 5.f, 6));  // step at frame 6
-  vm.run();
 
-  const size_t last = ml::kFramesPerBlock - 1;
-  CHECK(vm.registers[1][last] == 1.f);
-  CHECK(std::fabs(vm.registers[1][0] - 1.f / ml::kFramesPerBlock) < 1e-6f);
-  for (size_t i = 1; i < ml::kFramesPerBlock; ++i) CHECK(vm.registers[1][i] > vm.registers[1][i - 1]);
-  for (size_t i = 0; i < ml::kFramesPerBlock; ++i) CHECK(vm.registers[4][i] == 2.f);
-  CHECK(vm.registers[5][last] == 0.f);
-  CHECK(std::fabs(vm.registers[5][0] - (-1.f + 1.f / ml::kFramesPerBlock)) < 1e-6f);
-  for (size_t i = 0; i < 6; ++i) CHECK(vm.registers[6][i] == -1.f);
-  for (size_t i = 6; i < ml::kFramesPerBlock; ++i) CHECK(vm.registers[6][i] == 5.f);
+  // run 1: gate rises at frame 4; pitch 1.0; bend 0.5. All state starts at zero.
+  set(1, 0, ml::encodeGateTransition(true, 4));
+  set(0, 0, 1.f);
+  set(9, 0, 0.5f);
+  vm.run();
+  for (size_t i = 0; i < 4; ++i) CHECK(vm.registers[1][i] == 0.f);
+  for (size_t i = 4; i < kFramesPerBlock; ++i) CHECK(vm.registers[1][i] == 1.f);
+  for (size_t i = 0; i < 4; ++i) CHECK(vm.registers[2][i] == 0.f);     // held previous value
+  for (size_t i = 4; i < kFramesPerBlock; ++i) CHECK(vm.registers[2][i] == 1.f);  // stepped at the rise
+  CHECK(vm.registers[3][last] == 0.5f);                                 // ramp lands on the value
+  CHECK(std::fabs(vm.registers[3][0] - 0.5f / kFramesPerBlock) < 1e-6f);
+
+  // run 2: no transition, same values. Gate stays high, pitch flat, bend flat.
+  set(1, 0, ml::kNoGateTransition);
+  vm.run();
+  CHECK(allEqual(1, 1.f));
+  CHECK(allEqual(2, 1.f));
+  CHECK(allEqual(3, 0.5f));
+
+  // run 3: gate falls at frame 2; pitch moves to 2.0 with no rise, so it ramps.
+  set(1, 0, ml::encodeGateTransition(false, 2));
+  set(0, 0, 2.f);
+  vm.run();
+  for (size_t i = 0; i < 2; ++i) CHECK(vm.registers[1][i] == 1.f);
+  for (size_t i = 2; i < kFramesPerBlock; ++i) CHECK(vm.registers[1][i] == 0.f);
+  CHECK(vm.registers[2][last] == 2.f);
+  CHECK(vm.registers[2][0] > 1.f);
+  CHECK(vm.registers[2][0] < 2.f);
+
+  // run 4: gate rises at frame 0; pitch 3.0. The rise is detected against the stored
+  // gate level, so the sample-and-hold steps at frame 0.
+  set(1, 0, ml::encodeGateTransition(true, 0));
+  set(0, 0, 3.f);
+  vm.run();
+  CHECK(allEqual(1, 1.f));
+  CHECK(allEqual(2, 3.f));
+
+  // bank of two voices: LOAD_G.2 fills r1 and r2 from voices 0 and 1
+  auto rBank = assemble("ARENA events 16\nARENA kstate 16\nLOAD_G.2 r1, events/1, kstate/0\nHALT\n");
+  CHECK(rBank.ok());
+  MLVM vmBank;
+  CHECK(vmBank.loadProgram(rBank.program));
+  vmBank.arenas[0].floatVec[1 * 16 + 0] = ml::encodeGateTransition(true, 0);
+  vmBank.arenas[0].floatVec[1 * 16 + 1] = ml::encodeGateTransition(true, 10);
+  vmBank.run();
+  for (size_t i = 0; i < kFramesPerBlock; ++i) CHECK(vmBank.registers[1][i] == 1.f);
+  for (size_t i = 0; i < 10; ++i) CHECK(vmBank.registers[2][i] == 0.f);
+  for (size_t i = 10; i < kFramesPerBlock; ++i) CHECK(vmBank.registers[2][i] == 1.f);
 
   // an events arena with the wrong chunk size is refused
   auto bad = assemble("ARENA events 32\nHALT\n");
@@ -269,7 +312,7 @@ int main() {
   testVMArithmetic();
   testVMArenaAndBranch();
   testVMOutOfRangeArenaIsSafe();
-  testLoadK();
+  testControlRate();
 
   if (failures == 0) {
     std::printf("mlvm tests: all passed\n");

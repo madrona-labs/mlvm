@@ -15,8 +15,8 @@ namespace mlvm {
 
 // the event arena mirrors madronalib's control-rate layout exactly.
 static_assert(MLVM::kEventRows == ml::kNumControlRows, "event arena rows must match VoiceControls");
+static_assert(MLVM::kEventVoices == ml::kNumControlVoices, "event arena voices must match ControlRow");
 static_assert(MLVM::kEventChunkFloats * sizeof(float) == sizeof(ml::ControlRow), "event chunk must be one ControlRow");
-static_assert(MLVM::kControlBlockFloats * sizeof(float) == sizeof(ml::ControlBlock), "ControlBlock must be one float4");
 static_assert(sizeof(ml::VoiceControls) == MLVM::kEventRows * MLVM::kEventChunkFloats * sizeof(float),
               "one channel of VoiceControls must fill kEventRows consecutive chunks");
 
@@ -50,16 +50,13 @@ bool MLVM::loadProgram(const Program& newProgram) {
 // A float is the smallest thing in an arena, so arena chunk size 1 means 4 bytes.
 // Arena instructions have a bank size operand: a bank of N copies occupies N chunks,
 // so the chunk stride is multiplied by the bank size (bank size 0 means one copy).
-// Returns nullptr if the addressed region is not fully inside the arena, so a bad
-// program cannot read or write outside VM memory.
-float* MLVM::getArenaPtr(uint8_t arenaIdx, uint8_t chunk, uint8_t bankSize) {
+// Returns nullptr if floatsNeeded floats from the addressed chunk are not fully inside
+// the arena, so a bad program cannot read or write outside VM memory.
+float* MLVM::getArenaPtr(uint8_t arenaIdx, uint8_t chunk, uint8_t bankSize, size_t floatsNeeded) {
   FloatArena& a = arenas[arenaIdx];
   size_t copies = bankSize ? bankSize : 1;
-  size_t regionFloats = a.chunkSizeInFloats * copies;
-  size_t offset = chunk * regionFloats;
-  // a register load or store always moves one whole SignalBlock.
-  size_t needed = std::max(regionFloats, kFramesPerBlock);
-  if (offset + needed > a.floatVec.size()) return nullptr;
+  size_t offset = chunk * a.chunkSizeInFloats * copies;
+  if (offset + floatsNeeded > a.floatVec.size()) return nullptr;
   return a.floatVec.data() + offset;
 }
 
@@ -105,32 +102,78 @@ void MLVM::run() {
       case LOAD_I:
         registers[b1] = SignalBlock(getFloatImmediate(inst));
         break;
+      // ---- control rate
+      // These read one ml::ControlRow chunk (one float per voice) from fields 4,5 and
+      // keep per-voice state in the chunk at fields 6,7. Bank size 0 handles voice 0
+      // into dest; bank size N handles voices 0..N-1 into dest..dest+N-1, one voice per
+      // register, horizontal. One chunk holds all voices, so no bank stride on the
+      // arena pointers.
+      // TODO: replace the banked case with the vertical 4x4 layout once the bank
+      // layout TODO in the architecture doc is resolved.
       case LOAD_K: {
-        // control-rate chunk (one ml::ControlRow: 16 ControlBlocks, one per voice) to
-        // audio rate. A ramp moves from start to end, landing on end at the last frame;
-        // a step holds start until its frame, then end. Bank size 0 converts voice 0
-        // into dest. Bank size N converts voices 0..N-1 into dest..dest+N-1, one voice
-        // per register, horizontal.
-        // TODO: replace the banked case with the vertical 4x4 layout once the bank
-        // layout TODO in the architecture doc is resolved.
-        const float* chunk = getArenaPtr(b4, b5, 0);  // one chunk holds all voices: no bank stride
-        if (!chunk) break;
-        const size_t nVoices = std::min<size_t>(b3 ? b3 : 1, kEventChunkFloats / kControlBlockFloats);
+        // ramp from the previous value to the control value, landing on it at the last frame.
+        const float* cv = getArenaPtr(b4, b5, 0, kEventVoices);
+        float* state = getArenaPtr(b6, b7, 0, kEventVoices);
+        if (!cv || !state) break;
+        const size_t nVoices = std::min<size_t>(b3 ? b3 : 1, kEventVoices);
         for (size_t v = 0; v < nVoices && (b1 + v) < kNumRegisters; ++v) {
-          ControlBlock c;
-          std::memcpy(&c, chunk + kControlBlockFloats * v, sizeof(c));
-          registers[b1 + v] = interpolateBlockLinear(c);
+          registers[b1 + v] = interpolateBlockLinear(state[v], cv[v]);
+          state[v] = cv[v];
+        }
+        break;
+      }
+      case LOAD_KS: {
+        // sample and hold synced to the gate signal in src1 (an audio-rate 0/1 block,
+        // typically from LOAD_G): hold the previous value until the gate rises, then
+        // step to the control value. With no rise in the block, ramp like LOAD_K so
+        // continuous values (pitch under glide or bend) stay smooth.
+        // State chunk: [0, 16) previous values, [16, 32) previous gate levels.
+        const float* cv = getArenaPtr(b4, b5, 0, kEventVoices);
+        float* state = getArenaPtr(b6, b7, 0, 2 * kEventVoices);
+        if (!cv || !state || arenas[b6].chunkSizeInFloats < 2 * kEventVoices) break;
+        float* prevGate = state + kEventVoices;
+        const size_t nVoices = std::min<size_t>(b3 ? b3 : 1, kEventVoices);
+        for (size_t v = 0; v < nVoices && (b1 + v) < kNumRegisters && (b2 + v) < kNumRegisters; ++v) {
+          const SignalBlock& gate = registers[b2 + v];
+          bool prev = prevGate[v] > 0.5f;
+          int rise = -1;
+          for (size_t i = 0; i < kFramesPerBlock; ++i) {
+            const bool high = gate[i] > 0.5f;
+            if (high && !prev) { rise = static_cast<int>(i); break; }
+            prev = high;
+          }
+          if (rise >= 0) {
+            SignalBlock out(cv[v]);
+            for (int i = 0; i < rise; ++i) out[i] = state[v];
+            registers[b1 + v] = out;
+          } else {
+            registers[b1 + v] = interpolateBlockLinear(state[v], cv[v]);
+          }
+          state[v] = cv[v];
+          prevGate[v] = gate[kFramesPerBlock - 1] > 0.5f ? 1.f : 0.f;
+        }
+        break;
+      }
+      case LOAD_G: {
+        // expand gate transition codes (see MLDSPOps.h) to 0/1 blocks. State: gate level.
+        const float* codes = getArenaPtr(b4, b5, 0, kEventVoices);
+        float* level = getArenaPtr(b6, b7, 0, kEventVoices);
+        if (!codes || !level) break;
+        const size_t nVoices = std::min<size_t>(b3 ? b3 : 1, kEventVoices);
+        for (size_t v = 0; v < nVoices && (b1 + v) < kNumRegisters; ++v) {
+          const bool after = expandGate(codes[v], level[v] > 0.5f, registers[b1 + v]);
+          level[v] = after ? 1.f : 0.f;
         }
         break;
       }
       case LOAD:
-        if (float* src = getArenaPtr(b4, b5, b3)) {
+        if (float* src = getArenaPtr(b4, b5, b3, kFramesPerBlock)) {
           std::memcpy(registers[b1].data(), src, sizeof(SignalBlock));
         }
         break;
       case STORE:
         // the register operand is still field 1; the arena ref is the destination.
-        if (float* dest = getArenaPtr(b4, b5, b3)) {
+        if (float* dest = getArenaPtr(b4, b5, b3, kFramesPerBlock)) {
           std::memcpy(dest, registers[b1].data(), sizeof(SignalBlock));
         }
         break;

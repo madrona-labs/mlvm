@@ -45,8 +45,9 @@ struct ContextLogger
         std::cout << "phase:" << timeInfo.quarterNotesPhase_[0] << "\n";
         std::cout << "samples since start:" << timeInfo.samplesSinceStart << "\n";
         std::cout << "output 0-0:" << context->outputs[0][0] << "\n";
-        // r1 holds voice 0's pitch from LOAD_K: play MIDI notes and watch it follow.
-        std::cout << "voice 0 pitch (r1):" << vm->registers[1][0] << "\n";
+        // r1 is voice 0's gate and r2 its pitch: play MIDI notes and watch them follow.
+        std::cout << "voice 0 gate (r1):" << vm->registers[1][0]
+                  << " pitch (r2):" << vm->registers[2][0] << "\n";
         std::this_thread::sleep_for(std::chrono::milliseconds(1000));
       }
     });
@@ -94,16 +95,19 @@ int main( int argc, char *argv[] )
   // but right now we can use the assembler to write a
   // program that is like a single module.
   // Outputs are read from registers starting at kOutputRegisterBase.
-  // The "events" arena receives control-rate voice data from the host every block.
-  // Chunk 0 is channel 0, row 0 (pitch). LOAD_K ramps voice 0's pitch into r1.
-  // Oscillators are still stubs, so the outputs stay silent for now.
+  // The "events" arena receives control-rate voice data from the host every block,
+  // one chunk per row (see ml::ControlSignals): chunk 0 is pitch, chunk 1 is the gate.
+  // LOAD_G expands voice 0's gate to r1; LOAD_KS steps voice 0's pitch into r2 at the
+  // gate's rise. Oscillators are still stubs, so the outputs stay silent for now.
   const char* testCode = R"(
-    ARENA events 64
+    ARENA events 16
+    ARENA kstate 32
 
-    LOAD_K r1, events/0       // voice 0 pitch, audio rate
-    LOAD_I r2, 0.0f
-    MUL    r8, r1, r2         // output 0: silence
-    MOVE   r9, r8             // output 1
+    LOAD_G  r1, events/1, kstate/0        // voice 0 gate, 0/1 audio rate
+    LOAD_KS r2, r1, events/0, kstate/1    // voice 0 pitch, stepping at note onsets
+    LOAD_I  r3, 0.0f
+    MUL     r8, r2, r3                    // output 0: silence
+    MOVE    r9, r8                        // output 1
     HALT
   )";
 

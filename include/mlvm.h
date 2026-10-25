@@ -28,7 +28,8 @@ namespace mlvm {
 
 #define MLVM_OPCODES(X) \
   /* system */            X(NOOP) X(HALT) \
-  /* memory access */     X(MOVE) X(LOAD_I) X(LOAD_K) X(LOAD) X(STORE) \
+  /* memory access */     X(MOVE) X(LOAD_I) X(LOAD) X(STORE) \
+  /* control rate */      X(LOAD_K) X(LOAD_KS) X(LOAD_G) \
   /* compare and branch */X(CMP) X(BNE) X(JMP) \
   /* one-input math */    X(SIN) X(LOG) X(EXP) X(NEG) X(ABS) X(RCP) \
   /* two-input math */    X(ADD) X(ADD_WRAP) X(SUB) X(SUB_WRAP) X(MUL) X(DIV) \
@@ -161,14 +162,20 @@ struct MLVM {
   static constexpr size_t kOutputRegisterBase{kMaxInputs};
 
   // Event arena: control-rate voice data from the host, one chunk per (channel, row).
-  // A chunk is one ml::ControlRow: 16 ml::ControlBlocks of 4 floats each, 64 floats.
-  // Chunk index = channel * kEventRows + row. A program opts in by declaring
-  // "ARENA events 64" in its manifest; processBlock() then fills it every block and
-  // LOAD_K reads from it. See "Event and control inputs" in the architecture doc.
+  // A chunk is one ml::ControlRow: one float per voice, 16 floats.
+  // Chunk index = channel * kEventRows + row; rows follow ml::ControlSignals.
+  // A program opts in by declaring "ARENA events 16" in its manifest; processBlock()
+  // then fills it every block and the control-rate operators read from it:
+  //   LOAD_K  dest, events/row, state/chunk          ramp from previous value
+  //   LOAD_KS dest, gateReg, events/row, state/chunk sample and hold at the gate's rise
+  //   LOAD_G  dest, events/gate, state/chunk         expand gate transitions to 0/1
+  // Their state chunks hold one float per voice (LOAD_K, LOAD_G: 16 floats) or two
+  // (LOAD_KS: 32 floats, previous values then previous gate levels).
+  // See "Event and control inputs" in the architecture doc.
   static constexpr size_t kMaxEventChannels{8};
   static constexpr size_t kEventRows{10};         // == ml::kNumControlRows, checked in mlvm.cpp
-  static constexpr size_t kEventChunkFloats{64};  // == sizeof(ml::ControlRow) / sizeof(float)
-  static constexpr size_t kControlBlockFloats{4}; // == sizeof(ml::ControlBlock) / sizeof(float)
+  static constexpr size_t kEventVoices{16};       // == ml::kNumControlVoices
+  static constexpr size_t kEventChunkFloats{kEventVoices};  // == sizeof(ml::ControlRow) / sizeof(float)
   static constexpr const char* kEventArenaName{"events"};
 
   std::array< ml::SignalBlock, kNumRegisters > registers;
@@ -207,9 +214,10 @@ struct MLVM {
   void processBlock(ml::AudioContext* context);
 
 private:
-  // return a float ptr into the arena, which might contain parameters
-  // or SignalBlocks.
-  float* getArenaPtr(uint8_t arena, uint8_t chunk, uint8_t bankSize);
+  // return a float ptr into the arena at the given chunk, or nullptr if floatsNeeded
+  // floats from there would fall outside the arena. The chunk stride is scaled by the
+  // bank size (0 means one copy).
+  float* getArenaPtr(uint8_t arena, uint8_t chunk, uint8_t bankSize, size_t floatsNeeded);
 };
 
 } // namespace mlvm
