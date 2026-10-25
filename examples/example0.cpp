@@ -11,8 +11,7 @@
 #include "mlvm.h"
 #include "assembler.h"
 
-
-using namespace mlvm;
+using mlvm::MLVM;
 
 // TEMP
 constexpr int kInputChannels = 0;
@@ -26,36 +25,9 @@ struct VMExampleState {
 
 // processAudio() does all of the audio processing, in SignalBlock-sized chunks.
 // It is called every time a new buffer of audio is needed.
-void processAudio(AudioContext* ctx, VMExampleState* state)
+void processAudio(AudioContext* context, VMExampleState* state)
 {
-  MLVM* vm = state->vm;
-  
-  // copy audio, events and time inputs to vm registers
-  
-  // copy audio inputs to registers 0–7
-  for(int i=0; i<context->inputs.size(); ++i)
-  {
-    registers[i] = context->inputs[i];
-  }
-  
-  // copy event inputs to registers 8–15
-  for(int i=0; i<context->inputs.size(); ++i)
-  {
-    registers[i] = context->inputs[i];
-  }
-  
-  // copy time info to registers 16–17
-  for(int i=0; i<context->inputs.size(); ++i)
-  {
-    registers[i] = context->inputs[i];
-  }
-  
-  // run vm
-  vm->process(ctx);
-  
-  // copy vm output registers to outputs
-  
-  
+  state->vm->processBlock(context);
 }
 
 struct ContextLogger
@@ -111,31 +83,35 @@ int main( int argc, char *argv[] )
   // setup the vm
   MLVM vm;
 
-  // TODO compile the graph of modules, getting memory needs
+  // TODO compile a graph of modules, getting memory needs
   // auto testGraph = readJSONGraph;
   // vm.compile(testGraph, testProgram);
 
-  // but right now we can use a toy assembler to write a
-  // program that is like a single module
-  Assembler assembler;
+  // but right now we can use the assembler to write a
+  // program that is like a single module.
+  // Outputs are read from registers starting at kOutputRegisterBase.
+  const char* testCode = R"(
+    ARENA scratch 16
 
-  std::string testCode = R"(
-  MOV R1, #5          ; Move immediate 5 to R1
-  ADD R0, R1, #1      ; Add R1 + 1, store in R0
-  LDR R2, =1.0        ; Load literal from pool into R2
-  LDR R0, =0.         ; Load literal from pool into R0
-  STR R2, [#3]        ; Store R2 to arena at offset 3
-  MUL R0, R1, R2      ; Multiply R1 * R2, store in R0
-  MUL R0, R0, #1      ; Mul r0 * 0 : don't make sound 
-  END
+    LOAD_I r1, 0.0f           // silence
+    LOAD_I r2, 0.5f
+    MUL    r3, r1, r2
+    STORE  r3, scratch/0
+    LOAD   r8, scratch/0      // output 0
+    MOVE   r9, r8             // output 1
+    HALT
   )";
 
-  Program testProgram = assembler.assemble(testCode);
-  assembler.printProgram(testProgram);
+  mlvm::AssemblyResult assembled = mlvm::assemble(testCode);
+  if (!assembled.ok()) {
+    for (const auto& e : assembled.errors) {
+      std::cout << "line " << e.line << ": " << e.message << "\n";
+    }
+    return 1;
+  }
+  std::cout << mlvm::disassemble(assembled.program);
 
-  // TEMP allocate program memory and set opcodes explicitly
-  vm.allocateMemory(MemoryRequirements{ 128, 128 });
-  vm.setProgram(testProgram);
+  if (!vm.loadProgram(assembled.program)) return 1;
 
   // fill a struct with the data the callback will need to create a context.
   VMExampleState state{&vm};

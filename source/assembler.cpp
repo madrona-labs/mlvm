@@ -1,126 +1,385 @@
-//
-//  assembler.cpp
-//  mlvm
-//
-//  Created by Randy Jones on 6/27/25.
-//
+// mlvm
+// Copyright (c) 2025 Madrona Labs LLC. http://www.madronalabs.com
 
 #include "assembler.h"
 
+#include <cctype>
+#include <cstdlib>
+#include <sstream>
+#include <unordered_map>
+#include <variant>
+
 namespace mlvm {
 
+namespace {
 
-Program Assembler::assemble(const std::string& assemblyCode) {
-  Program program;
-  program.memReqs = {0, 0}; // Default memory requirements
-  
-  std::stringstream ss(assemblyCode);
-  std::string line;
-  
-  while (std::getline(ss, line)) {
-    line = trim(line);
-    
-    // Skip empty lines and comments
-    if (line.empty() || line[0] == ';' || line.substr(0, 2) == "//") {
-      continue;
+// ----------------------------------------------------------------
+// operand kinds. Kind is decided purely from the token text.
+
+struct RegisterRef { uint8_t idx; };
+struct ArenaRef { uint8_t arena; uint8_t chunk; };
+struct FloatImm { float value; };
+struct ByteImm { uint8_t value; };
+struct LabelRef { std::string name; };
+
+using Operand = std::variant<RegisterRef, ArenaRef, FloatImm, ByteImm, LabelRef>;
+
+// a branch whose target label is resolved after all instructions are seen.
+struct Fixup {
+  size_t instructionIdx;
+  std::string label;
+  int line;
+};
+
+// ----------------------------------------------------------------
+// text helpers
+
+std::string_view trim(std::string_view s) {
+  const char* ws = " \t\r\n";
+  size_t start = s.find_first_not_of(ws);
+  if (start == std::string_view::npos) return {};
+  size_t end = s.find_last_not_of(ws);
+  return s.substr(start, end - start + 1);
+}
+
+std::string_view stripComment(std::string_view s) {
+  size_t slashes = s.find("//");
+  size_t semi = s.find(';');
+  size_t cut = std::min(slashes, semi);
+  return cut == std::string_view::npos ? s : s.substr(0, cut);
+}
+
+std::string toUpper(std::string_view s) {
+  std::string r(s);
+  for (auto& c : r) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+  return r;
+}
+
+// split on whitespace and commas.
+std::vector<std::string_view> splitTokens(std::string_view s) {
+  std::vector<std::string_view> tokens;
+  size_t i = 0;
+  while (i < s.size()) {
+    while (i < s.size() && (std::isspace(static_cast<unsigned char>(s[i])) || s[i] == ',')) ++i;
+    size_t start = i;
+    while (i < s.size() && !std::isspace(static_cast<unsigned char>(s[i])) && s[i] != ',') ++i;
+    if (i > start) tokens.push_back(s.substr(start, i - start));
+  }
+  return tokens;
+}
+
+bool isAllDigits(std::string_view s) {
+  if (s.empty()) return false;
+  for (char c : s) if (!std::isdigit(static_cast<unsigned char>(c))) return false;
+  return true;
+}
+
+bool parseUInt(std::string_view s, unsigned& out) {
+  if (!isAllDigits(s) || s.size() > 9) return false;
+  out = 0;
+  for (char c : s) out = out * 10 + (c - '0');
+  return true;
+}
+
+// a float literal must contain '.' or end in 'f' so that bare integers stay integers.
+bool parseFloatLiteral(std::string_view s, float& out) {
+  if (s.empty()) return false;
+  bool suffix = (s.back() == 'f' || s.back() == 'F');
+  if (!suffix && s.find('.') == std::string_view::npos) return false;
+  std::string body(suffix ? s.substr(0, s.size() - 1) : s);
+  if (body.empty()) return false;
+  char* end = nullptr;
+  out = std::strtof(body.c_str(), &end);
+  return end == body.c_str() + body.size();
+}
+
+bool isIdentifier(std::string_view s) {
+  if (s.empty()) return false;
+  unsigned char c0 = static_cast<unsigned char>(s[0]);
+  if (!(std::isalpha(c0) || c0 == '_')) return false;
+  for (char c : s) {
+    unsigned char uc = static_cast<unsigned char>(c);
+    if (!(std::isalnum(uc) || uc == '_' || uc == '-')) return false;
+  }
+  return true;
+}
+
+// ----------------------------------------------------------------
+// Parser: one pass over the lines, then label fixups.
+
+class Parser {
+public:
+  AssemblyResult parse(std::string_view source) {
+    line_ = 0;
+    size_t pos = 0;
+    while (pos <= source.size()) {
+      size_t nl = source.find('\n', pos);
+      std::string_view rawLine = source.substr(pos, nl == std::string_view::npos ? std::string_view::npos : nl - pos);
+      ++line_;
+      parseLine(trim(stripComment(rawLine)));
+      if (nl == std::string_view::npos) break;
+      pos = nl + 1;
     }
-    
-    std::vector<std::string> tokens = tokenize(line);
-    if (tokens.empty()) continue;
-    
-    // Parse instruction
-    std::string opName = tokens[0];
-    std::transform(opName.begin(), opName.end(), opName.begin(), ::toupper);
-    
-    if (opMap.find(opName) == opMap.end()) {
-      std::cerr << "Unknown operation: " << opName << std::endl;
-      continue;
-    }
-    
-    Instruction instr = {};
-    instr.opcode = opMap[opName]; // MODE_0 by default
-    
-    // Parse operands based on instruction type
-    operations op = opMap[opName];
-    
-    if (op == LOAD || op == STORE) {
-      // LOAD/STORE: dest is register, src is memory (uses src1+src2)
-      if (tokens.size() >= 2) {
-        instr.dest = createRegisterOperand(tokens[1]);
+    resolveFixups();
+    return std::move(result_);
+  }
+
+private:
+  AssemblyResult result_;
+  std::unordered_map<std::string, uint8_t> arenaIndices_;
+  std::unordered_map<std::string, size_t> labels_;   // label -> index of the next instruction
+  std::vector<Fixup> fixups_;
+  int line_{0};
+
+  void error(std::string msg) {
+    result_.errors.push_back({line_, std::move(msg)});
+  }
+
+  void parseLine(std::string_view text) {
+    if (text.empty()) return;
+    auto tokens = splitTokens(text);
+    if (tokens.empty()) return;
+
+    // label?
+    if (tokens[0].back() == ':') {
+      std::string_view name = tokens[0].substr(0, tokens[0].size() - 1);
+      if (!isIdentifier(name)) {
+        error("bad label '" + std::string(name) + "'");
+      } else if (labels_.count(std::string(name))) {
+        error("duplicate label '" + std::string(name) + "'");
+      } else {
+        labels_[std::string(name)] = result_.program.instructions.size();
       }
-      if (tokens.size() >= 3) {
-        uint16_t literalIndex{0};
-        if(isLiteral(tokens[2]))
-        {
-          // Add float to literal pool and get index
-          program.literalPool.push_back(parseLiteral(tokens[2]));
-          literalIndex = program.literalPool.size() - 1;
-          literalIndex &= 0xCFFF; // toy impl, wrap
+      tokens.erase(tokens.begin());
+      if (tokens.empty()) return;
+    }
+
+    std::string head = toUpper(tokens[0]);
+    if (head == "ARENA") {
+      parseArena(tokens);
+    } else {
+      parseInstruction(tokens);
+    }
+  }
+
+  // ARENA name chunkSizeInFloats
+  void parseArena(const std::vector<std::string_view>& tokens) {
+    if (tokens.size() != 3) {
+      error("ARENA takes a name and a chunk size in floats");
+      return;
+    }
+    std::string name(tokens[1]);
+    unsigned chunkSize = 0;
+    if (!isIdentifier(name)) {
+      error("bad arena name '" + name + "'");
+      return;
+    }
+    if (!parseUInt(tokens[2], chunkSize) || chunkSize == 0) {
+      error("bad arena chunk size '" + std::string(tokens[2]) + "'");
+      return;
+    }
+    if (arenaIndices_.count(name)) {
+      error("duplicate arena '" + name + "'");
+      return;
+    }
+    if (result_.program.manifest.size() >= MLVM::kNumArenas) {
+      error("too many arenas (max " + std::to_string(MLVM::kNumArenas) + ")");
+      return;
+    }
+    arenaIndices_[name] = static_cast<uint8_t>(result_.program.manifest.size());
+    result_.program.manifest.push_back({name, chunkSize});
+  }
+
+  // MNEMONIC[.bank] operand, operand, ...
+  void parseInstruction(const std::vector<std::string_view>& tokens) {
+    std::string_view mnemonic = tokens[0];
+    std::string_view bankText;
+    size_t dot = mnemonic.find('.');
+    if (dot != std::string_view::npos) {
+      bankText = mnemonic.substr(dot + 1);
+      mnemonic = mnemonic.substr(0, dot);
+    }
+
+    auto op = opcodeFromName(toUpper(mnemonic));
+    if (!op) {
+      error("unknown instruction '" + std::string(mnemonic) + "'");
+      return;
+    }
+
+    unsigned bank = 0;
+    if (!bankText.empty() && (!parseUInt(bankText, bank) || bank > 255)) {
+      error("bad bank size '" + std::string(bankText) + "'");
+      return;
+    }
+
+    Instruction inst{};
+    inst[0] = *op;
+    inst[3] = static_cast<uint8_t>(bank);
+
+    std::vector<Operand> operands;
+    bool operandsOk = true;
+    for (size_t i = 1; i < tokens.size(); ++i) {
+      auto operand = parseOperand(tokens[i]);
+      if (!operand) { operandsOk = false; continue; }
+      operands.push_back(std::move(*operand));
+    }
+    if (!operandsOk) return;
+
+    if (encode(inst, operands)) {
+      result_.program.instructions.push_back(inst);
+    }
+  }
+
+  std::optional<Operand> parseOperand(std::string_view tok) {
+    // register: r0..r255
+    if (tok.size() >= 2 && (tok[0] == 'r' || tok[0] == 'R') && isAllDigits(tok.substr(1))) {
+      unsigned idx = 0;
+      if (!parseUInt(tok.substr(1), idx) || idx >= MLVM::kNumRegisters) {
+        error("register out of range '" + std::string(tok) + "'");
+        return std::nullopt;
+      }
+      return Operand{RegisterRef{static_cast<uint8_t>(idx)}};
+    }
+
+    // arena ref: name/chunk or index/chunk
+    size_t slash = tok.find('/');
+    if (slash != std::string_view::npos) {
+      std::string_view arenaText = tok.substr(0, slash);
+      std::string_view chunkText = tok.substr(slash + 1);
+      unsigned arena = 0, chunk = 0;
+      if (isAllDigits(arenaText)) {
+        if (!parseUInt(arenaText, arena) || arena >= MLVM::kNumArenas) {
+          error("arena index out of range '" + std::string(tok) + "'");
+          return std::nullopt;
         }
-        auto [src1, src2] = createMemoryOperands(tokens[2], literalIndex);
-        instr.src1 = src1;
-        instr.src2 = src2;
+      } else {
+        auto it = arenaIndices_.find(std::string(arenaText));
+        if (it == arenaIndices_.end()) {
+          error("undeclared arena '" + std::string(arenaText) + "'");
+          return std::nullopt;
+        }
+        arena = it->second;
       }
-    } else {
-      // Other instructions use register/immediate operands
-      if (tokens.size() >= 2) {
-        instr.dest = createRegisterOperand(tokens[1]);
+      if (!parseUInt(chunkText, chunk) || chunk >= MLVM::kChunksPerArena) {
+        error("bad arena chunk '" + std::string(tok) + "'");
+        return std::nullopt;
       }
-      if (tokens.size() >= 3) {
-        instr.src1 = createRegisterOperand(tokens[2]);
+      return Operand{ArenaRef{static_cast<uint8_t>(arena), static_cast<uint8_t>(chunk)}};
+    }
+
+    // bare integer: one byte
+    if (isAllDigits(tok)) {
+      unsigned v = 0;
+      if (!parseUInt(tok, v) || v > 255) {
+        error("integer operand out of range '" + std::string(tok) + "'");
+        return std::nullopt;
       }
-      if (tokens.size() >= 4) {
-        instr.src2 = createRegisterOperand(tokens[3]);
+      return Operand{ByteImm{static_cast<uint8_t>(v)}};
+    }
+
+    // float immediate
+    float f = 0.f;
+    if (parseFloatLiteral(tok, f)) {
+      return Operand{FloatImm{f}};
+    }
+
+    // label
+    if (isIdentifier(tok)) {
+      return Operand{LabelRef{std::string(tok)}};
+    }
+
+    error("bad operand '" + std::string(tok) + "'");
+    return std::nullopt;
+  }
+
+  // Place operands into fields by kind. Returns false and reports an error if
+  // two operands claim the same field.
+  bool encode(Instruction& inst, const std::vector<Operand>& operands) {
+    static constexpr uint8_t kRegisterSlots[] = {1, 2, 4, 5};
+    static constexpr uint8_t kArenaSlots[][2] = {{4, 5}, {6, 7}};
+    size_t nextRegister = 0;
+    size_t nextArena = 0;
+    uint8_t used = 0;   // bitmask of fields written
+
+    auto claim = [&](uint8_t field) {
+      if (used & (1 << field)) {
+        error("too many operands: field " + std::to_string(field) + " is already in use");
+        return false;
+      }
+      used |= (1 << field);
+      return true;
+    };
+
+    for (const auto& operand : operands) {
+      if (auto* r = std::get_if<RegisterRef>(&operand)) {
+        if (nextRegister >= 4) { error("too many register operands"); return false; }
+        uint8_t field = kRegisterSlots[nextRegister++];
+        if (!claim(field)) return false;
+        inst[field] = r->idx;
+      } else if (auto* a = std::get_if<ArenaRef>(&operand)) {
+        if (nextArena >= 2) { error("too many arena operands"); return false; }
+        const auto& slots = kArenaSlots[nextArena++];
+        if (!claim(slots[0]) || !claim(slots[1])) return false;
+        inst[slots[0]] = a->arena;
+        inst[slots[1]] = a->chunk;
+      } else if (auto* f = std::get_if<FloatImm>(&operand)) {
+        for (uint8_t field = 4; field <= 7; ++field) if (!claim(field)) return false;
+        setFloatImmediate(inst, f->value);
+      } else if (auto* b = std::get_if<ByteImm>(&operand)) {
+        if (!claim(5)) return false;
+        inst[5] = b->value;
+      } else if (auto* l = std::get_if<LabelRef>(&operand)) {
+        if (!claim(6) || !claim(7)) return false;
+        fixups_.push_back({result_.program.instructions.size(), l->name, line_});
       }
     }
-    
-    program.instructions.push_back(instr);
+    return true;
   }
-  
-  return program;
+
+  void resolveFixups() {
+    for (const auto& fixup : fixups_) {
+      auto it = labels_.find(fixup.label);
+      if (it == labels_.end()) {
+        result_.errors.push_back({fixup.line, "undefined label '" + fixup.label + "'"});
+        continue;
+      }
+      // offset is relative to the instruction after the branch
+      long long offset = static_cast<long long>(it->second) - static_cast<long long>(fixup.instructionIdx + 1);
+      if (offset < INT16_MIN || offset > INT16_MAX) {
+        result_.errors.push_back({fixup.line, "branch to '" + fixup.label + "' is out of range"});
+        continue;
+      }
+      if (fixup.instructionIdx < result_.program.instructions.size()) {
+        setAddressOffset(result_.program.instructions[fixup.instructionIdx], static_cast<int16_t>(offset));
+      }
+    }
+  }
+};
+
+} // anonymous namespace
+
+AssemblyResult assemble(std::string_view source) {
+  Parser p;
+  return p.parse(source);
 }
-  
-void Assembler::printProgram(const Program& program) {
-  std::cout << "Program with " << program.instructions.size() << " instructions:\n";
-  
+
+std::string disassemble(const Program& program) {
+  std::ostringstream out;
+  for (size_t i = 0; i < program.manifest.size(); ++i) {
+    const auto& a = program.manifest[i];
+    out << "ARENA " << a.name << " " << a.chunkSizeInFloats << "   // arena " << i << "\n";
+  }
   for (size_t i = 0; i < program.instructions.size(); ++i) {
-    const auto& instr = program.instructions[i];
-    operations op = (operations)getOperation(instr.opcode);
-    
-    std::cout << i << ": ";
-    std::cout << "Op=" << op << " ";
-    
-    if (op == LOAD || op == STORE) {
-      // For LOAD/STORE, combine src1+src2 to show memory address
-      uint16_t memAddr = ((getIndex(instr.src1) << 7) | getIndex(instr.src2));
-      bool isLiteral = (getOperandMode(instr.src1) == LITERAL);
-      std::cout << "Dest=R" << getIndex(instr.dest) << " ";
-      std::cout << "MemAddr=" << memAddr << "(" << (isLiteral ? "LITERAL" : "ARENA") << ")";
-    } else {
-      std::cout << "Dest=R" << getIndex(instr.dest) << " ";
-      std::cout << "Src1=";
-      if (getOperandMode(instr.src1) == IMMEDIATE) {
-        std::cout << "#" << getIndex(instr.src1);
-      } else {
-        std::cout << "R" << getIndex(instr.src1);
-      }
-      std::cout << " Src2=";
-      if (getOperandMode(instr.src2) == IMMEDIATE) {
-        std::cout << "#" << getIndex(instr.src2);
-      } else {
-        std::cout << "R" << getIndex(instr.src2);
-      }
+    const Instruction& inst = program.instructions[i];
+    std::string mnemonic(opcodeName(getOpcode(inst)));
+    if (inst[3]) mnemonic += "." + std::to_string(inst[3]);
+    out << i << ":\t" << mnemonic << "\t";
+    for (size_t f = 1; f < inst.size(); ++f) {
+      out << static_cast<unsigned>(inst[f]) << (f + 1 < inst.size() ? " " : "");
     }
-    std::cout << "\n";
+    out << "\n";
   }
-  
-  if (!program.literalPool.empty()) {
-    std::cout << "\nLiteral Pool:\n";
-    for (size_t i = 0; i < program.literalPool.size(); ++i) {
-      std::cout << i << ": " << program.literalPool[i] << "\n";
-    }
-  }
+  return out.str();
 }
 
-
-}
+} // namespace mlvm

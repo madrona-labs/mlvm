@@ -319,14 +319,19 @@ endif()
 # build tests
 #--------------------------------------------------------------------
 
-#if(BUILD_TESTS)
-#    set(target tests)
-#    file(GLOB TEST_SOURCES "tests/*.*")
-#    add_executable(tests ${TEST_SOURCES})
-#    set_target_properties(tests PROPERTIES EXCLUDE_FROM_ALL TRUE)
-#    add_dependencies(tests mlvm)
-#    target_link_libraries(tests mlvm)
-#endif()
+if(BUILD_TESTS)
+    file(GLOB TEST_SOURCES "tests/*.cpp")
+    add_executable(tests ${TEST_SOURCES})
+    target_include_directories(tests PRIVATE ${MADRONALIB_INCLUDE_DIR})
+    target_link_libraries(tests PRIVATE mlvm)
+    if(APPLE)
+        target_link_libraries(tests PRIVATE "${MADRONALIB_LIBRARY_DIR}/lib${madronalib_NAME}.a")
+    elseif(WIN32)
+        target_link_libraries(tests PRIVATE "${MADRONALIB_LIBRARY_DIR}/${madronalib_NAME}.lib")
+    endif()
+    enable_testing()
+    add_test(NAME mlvm_tests COMMAND tests)
+endif()
 
 #--------------------------------------------------------------------
 # Including custom cmake rules
