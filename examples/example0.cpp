@@ -45,10 +45,9 @@ struct ContextLogger
         std::cout << "phase:" << timeInfo.quarterNotesPhase_[0] << "\n";
         std::cout << "samples since start:" << timeInfo.samplesSinceStart << "\n";
         std::cout << "output 0-0:" << context->outputs[0][0] << "\n";
-        // r1 is voice 0's gate, r2 its pitch, r3 the mod wheel: play and watch them follow.
+        // r1 is voice 0's gate; r8 is the mix of all voices' pitch * mod wheel * gate.
         std::cout << "voice 0 gate (r1):" << vm->registers[1][0]
-                  << " pitch (r2):" << vm->registers[2][0]
-                  << " mod wheel (r3):" << vm->registers[3][kFramesPerBlock - 1] << "\n";
+                  << " mix (r8):" << vm->registers[8][kFramesPerBlock - 1] << "\n";
         std::this_thread::sleep_for(std::chrono::milliseconds(1000));
       }
     });
@@ -109,12 +108,17 @@ int main( int argc, char *argv[] )
     EXTERN ctl0 1
     ARENA  kstate 32
 
-    LOAD_G  r1, events0/1, kstate/0        // voice 0 gate, 0/1 audio rate
-    LOAD_KS r2, r1, events0/0, kstate/1    // voice 0 pitch, stepping at note onsets
-    LOAD_K  r3, ctl0/1, kstate/2           // mod wheel, ramped
-    LOAD    r4, audioin/0
-    STORE   r4, audioout/0
-    STORE   r4, audioout/1
+    // a 16-voice bank: gates, pitches stepping at onsets, mod wheel broadcast to all voices
+    LOAD_G.16   r16, events0/1, kstate/0         // gates   -> r16..r31 (vertical)
+    LOAD_KS.16  r32, r16, events0/0, kstate/1    // pitches -> r32..r47
+    LOAD_K.16   r48, ctl0/1, kstate/2            // mod wheel in every lane -> r48..r63
+    MUL.16      r64, r32, r48                    // pitch * mod, per voice (stands in for a synth voice)
+    MUL.16      r64, r64, r16                    // gated
+    MIX.16      r8, r64                          // sum the voices
+    UNBANK.4    r1, r16                          // voice 0's gate, horizontal, for the logger
+    LOAD        r4, audioin/0
+    STORE       r4, audioout/0
+    STORE       r4, audioout/1
     HALT
   )";
 

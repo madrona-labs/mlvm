@@ -59,9 +59,26 @@ Index of the src1 register.
 
 #### Field 3: bank size
 
-Operators in mlvm can process multiple independent copies of a computation in a single instruction, controlled by the bank size field. A bank size of 0 means a single horizontal calculation, where each float is one frame in a single time series — one signal block in, one signal block out. A bank size of N where N is 1 or more means N independent 4x blocks of the operation are calculated simultaneously, each with its own input signals and state. The 4x blocks are SIMD-optimized and treat each 16-float block of data as 4 frames, each with 4 independent lanes. Banks are the mechanism for polyphony: a 16-voice synthesizer runs a filter bank of 16 instances per instruction rather than 16 separate filter instructions, reducing dispatch overhead.
+Operators in mlvm can process multiple independent voices in a single instruction, controlled by the bank size field. Banks are the mechanism for polyphony: a 16-voice synthesizer runs one filter instruction with bank size 16 rather than 16 filter instructions, and the inner loop is SIMD over four voices at a time.
 
-TODO: make the bank size description less confusing and add a figure showing bank order in memory!
+The bank size is a **voice count, 0 or a multiple of 4**. Bank size 0 means a single horizontal calculation: a register is one time series, one float per frame, one signal block in, one signal block out. A bank of N voices at register r occupies registers r through r+N−1 as N/4 madronalib `SignalBlock4`s in the **vertical** layout: one float4 per frame holding four voices, so voice v of the bank is lane v mod 4 of group v div 4. This is exactly the layout madronalib's `GenBank` and `FilterBank` compute in, so an mlvm bank hands madronalib processors their data with no rearrangement.
+
+```
+bank of 8 voices at r16, 64-frame block:
+
+ register r16..r19  (group 0, one SignalBlock4)
+   frame 0:  v0[0] v1[0] v2[0] v3[0]
+   frame 1:  v0[1] v1[1] v2[1] v3[1]
+   ...
+   frame 63: v0[63] v1[63] v2[63] v3[63]
+ register r20..r23  (group 1)
+   frame 0:  v4[0] v5[0] v6[0] v7[0]
+   ...
+```
+
+A bank uses the same memory as N horizontal voices, just arranged differently. **Elementwise operators are layout-blind**: ADD.16 applies to 16 registers in turn, which is correct for both layouts because the same index goes in and out. Only time-dependent operators (ramps, gates, filters, generators) and layout operators need to know the arrangement. Bank sizes that are not 0 or a multiple of 4 are assembler errors, as is a bank that does not fit in the register file.
+
+Meeting a horizontal signal with a bank, say a global LFO or a channel-wide controller against 16 voices, is a layout operation: `SPREAD.16` broadcasts a horizontal register into a bank, and the control-rate operators broadcast a one-float row (a controller) into every lane directly, so channel-wide controllers never need SPREAD. `MIX.16` sums a bank into one horizontal signal, the last step of every polyphonic synth. `BANK` and `UNBANK` convert between N horizontal voice registers and a vertical bank.
 
 #### Field 4: [src2 index, params arena, immed. 24-31]
 
@@ -91,7 +108,7 @@ Chunk of the arena for ops with arena-stored states, or low bits of 16-bit jump 
 | **Projections** (PROJ) (*2) | op | dest | src1 | bank size | params arena | params chunk | proj. type | `[unused]` |
 | **Memory access** (LOAD\_I, MOV...) (*3) | op | dest | src1 | `[unused]` | immed. 24:31 | immed. 16:23 | immed. 8:15 | immed. 0:7 |
 | **Arena access** (LOAD, STORE, ...) (*3) | op | dest | src1 | `[unused]` | src1 arena | src1 chunk | dest arena | dest chunk |
-| **Layout** (FILL, TRANSPOSE...) (*4) | op | dest | src1 | bank size | src2 | element\# | `[unused]` | `[unused]` |
+| **Layout** (FILL, SPREAD, MIX, BANK, UNBANK...) (*4) | op | dest | src1 | bank size | src2 | element\# | `[unused]` | `[unused]` |
 | **Compare and branch** (CMP, JMP...) (*5) | op | `[unused]` | src1 | `[unused]` | src2 | `[unused]` | pc offset 8:15 | pc offset 0:7 |
 | **Matrix** (MATMUL) (*6) | op | src2 arena | src2 chunk | matrix size(s) | src1 arena | src1 chunk | dest arena | dest chunk |
 
@@ -102,7 +119,7 @@ Chunk of the arena for ops with arena-stored states, or low bits of 16-bit jump 
 
 **(*3) Memory access** — Examples: LOAD\_I places a scalar float immediate into a register. LOAD / STORE read from / write to arenas. 
 
-**(*4) Layout** — Examples: FILL broadcasts element N of src1 to all elements of dest. TRANSPOSE converts between horizontal and vertical signal layouts.
+**(*4) Layout** — FILL broadcasts element N of src1 to all elements of dest. SPREAD broadcasts a horizontal signal into a bank. MIX sums a bank into a horizontal signal. BANK and UNBANK convert between N horizontal voice registers and a vertical bank; their source and destination must not overlap.
 
 **(*5) Compare and branch** — CMP tests a condition across frames in a signal (ALL frames, ANY frame, etc.) and sets a flag register. JMP reads that flag. Target is a signed PC offset giving a range of ±32K instructions. Details TBD.
 
@@ -255,7 +272,9 @@ LOAD\_KS is the one that makes notes sample accurate: velocity, pitch, elapsed t
 
 **Ramps are 16 frames long regardless of the block size.** LOAD\_K and LOAD\_KS ramp over `kControlRampFrames` frames (16, clamped to the block if it is shorter) and then hold, rather than ramping over the whole block. A program therefore sounds the same at block size 16, 64 or 256. This sets the pattern for every operator that depends on time: express it in frames or seconds, never in blocks. The choice of interpolation (linear now; a glide operator with a variable time, or other curves, later) belongs to the VM, which keeps madronalib general-purpose.
 
-Banking is what keeps programs short. One instruction converts one row for all voices, so a 16-voice synth using gate, pitch and velocity needs three instructions, not 48. A synth converts only the rows it uses, and the VM only does conversion work for rows that are read. The frame and lane arrangement for a bank follows the bank layout; the operators' definitions do not depend on it.
+Banking is what keeps programs short. One instruction converts one row for all voices, so a 16-voice synth using gate, pitch and velocity needs three instructions, not 48. A synth converts only the rows it uses, and the VM only does conversion work for rows that are read. With a bank size these operators write vertical banks directly: a `ControlRow` holds its 16 voices contiguously, so voices 0 to 3 are one float4 load, the lane order a vertical group wants, and LOAD\_K for a group is one float4 ramp. A one-float row (a controller) is broadcast to every lane.
+
+A stateful operator does not always need LOAD\_K in front of it. madronalib's processors accept per-block parameters, one float4 per group of voices, and interpolate inside, and a `ControlRow` already has that shape. So SAW can take its pitch straight from `events0/pitch` through its params fields when nothing else needs that value at audio rate. LOAD\_K is for values the program does arithmetic on.
 
 ```
 LOAD_G.4   r16, events/gate,  kstate/0
@@ -338,6 +357,8 @@ After that: stateful operator state layouts (SAW, SVF), bank inner loops, time i
 - **Host data is bound, not copied**: `EXTERN` arenas for audio I/O, voice controls and controllers, one per channel, bound by name each block. The copies were cheap (about 1% of a block on the design-floor platform) but a bound pointer costs nothing for data a program does not read, lets the producer update controllers only on events, and makes host input one mechanism. Registers are now purely program scratch.  
 - **128 controllers per channel, raw values, VM interpolates**: smoothing moves from the producer to the consumer so a program chooses it. Channel pressure stays in the z voice row.  
 - **16-frame control ramps**: time in frames, never in blocks, so programs are block-size independent.  
+- **Bank size is a voice count, a multiple of 4, in madronalib's vertical layout**: N voices occupy N registers as N/4 SignalBlock4s. Elementwise operators are layout-blind. SPREAD, MIX, BANK and UNBANK move between layouts; control-rate operators write banks directly and broadcast one-float rows.  
+- **One event channel per bank**: multitimbral programs run one bank per channel. MPE per-note controls arrive as voice rows already.  
 - **madronalib owns ControlBlock, mlvm owns the arena mapping**: madronalib exports plain data with a documented layout and never learns about arenas. The boundary is one memcpy per block.  
 - **Opcodes declared once**: an X-macro list generates the enum and the mnemonic table, so the assembler can never fall out of sync with the VM.
 
@@ -346,7 +367,8 @@ After that: stateful operator state layouts (SAW, SVF), bank inner loops, time i
 
 - Compare and branch semantics: exact conditions (ALL, ANY, threshold?), flag register count. CMP has sources but no dest, so the assembler's generic register placement currently puts src1 in field 1 rather than field 2. Resolve together with the semantics, either by giving CMP a dest (flag in a register) or by adding a per-opcode operand format column to the opcode list.  
 - When to turn off a-rate event signal generation in EventsToSignals once mlvm no longer reads it  
-- Vertical 4x4 bank layout for the control-rate operators; they are one voice per register until the bank layout is settled  
+- madronalib's per-block `Params` interpolation inside processors spans the block; it should become 16 frames to match LOAD\_K and keep sounds block-size independent  
+- Fused broadcast variants of ADD/MUL (bank × horizontal without SPREAD) only if profiles show SPREAD's extra registers matter  
 - Time info (tempo, beat phase, samples since start) as control rows in their own chunk; beat phase needs an unwrapped end value so a ramp across the wrap goes the right way  
 - Projection type encoding: list of 256 projection functions TBD  
 - Whether JIT compilation is in scope (not planned for v0.2)  

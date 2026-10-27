@@ -214,6 +214,10 @@ private:
       error("bad bank size '" + std::string(bankText) + "'");
       return;
     }
+    if (bank % 4 != 0) {
+      error("bank size must be 0 or a multiple of 4, got " + std::to_string(bank));
+      return;
+    }
 
     Instruction inst{};
     inst[0] = *op;
@@ -228,9 +232,19 @@ private:
     }
     if (!operandsOk) return;
 
-    if (encode(inst, operands)) {
-      result_.program.instructions.push_back(inst);
+    if (!encode(inst, operands)) return;
+
+    // a bank of N voices occupies N registers from each register operand.
+    if (bank) {
+      for (uint8_t field : {uint8_t(1), uint8_t(2), uint8_t(4), uint8_t(5)}) {
+        if ((registerFields_ & (1 << field)) && (inst[field] + bank > MLVM::kNumRegisters)) {
+          error("bank of " + std::to_string(bank) + " voices at r" + std::to_string(inst[field]) +
+                " does not fit in the register file");
+          return;
+        }
+      }
     }
+    result_.program.instructions.push_back(inst);
   }
 
   std::optional<Operand> parseOperand(std::string_view tok) {
@@ -295,6 +309,9 @@ private:
     return std::nullopt;
   }
 
+  // bitmask of the fields that hold register indices in the instruction most recently encoded.
+  uint8_t registerFields_{0};
+
   // Place operands into fields by kind. Returns false and reports an error if
   // two operands claim the same field.
   bool encode(Instruction& inst, const std::vector<Operand>& operands) {
@@ -303,6 +320,7 @@ private:
     size_t nextRegister = 0;
     size_t nextArena = 0;
     uint8_t used = 0;   // bitmask of fields written
+    registerFields_ = 0;
 
     auto claim = [&](uint8_t field) {
       if (used & (1 << field)) {
@@ -319,6 +337,7 @@ private:
         uint8_t field = kRegisterSlots[nextRegister++];
         if (!claim(field)) return false;
         inst[field] = r->idx;
+        registerFields_ |= (1 << field);
       } else if (auto* a = std::get_if<ArenaRef>(&operand)) {
         if (nextArena >= 2) { error("too many arena operands"); return false; }
         const auto& slots = kArenaSlots[nextArena++];

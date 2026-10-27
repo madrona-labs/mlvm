@@ -36,7 +36,7 @@ namespace mlvm {
   /* three-input math */  X(LERP) X(CLAMP) X(SELECT) \
   /* generators */        X(SINE) X(IMPULSE) X(SAW) X(NOISE) \
   /* filters */           X(SVF) X(FOUR_POLE) \
-  /* layout */            X(FILL) X(TRANSPOSE) \
+  /* layout */            X(FILL) X(SPREAD) X(MIX) X(BANK) X(UNBANK) \
   /* misc */              X(SHIFT) X(INTERP)
   // ... and many more
   // many opcodes will be much bigger chunks of stateful work like oscillators, table lookups,
@@ -221,6 +221,23 @@ struct MLVM {
   // control-rate values ramp over this many frames regardless of the block size, so
   // a program sounds the same at any block size. Clamped to the block if it is shorter.
   static constexpr size_t kControlRampFrames{16};
+
+  // Banks. The bank size field is a voice count, 0 or a multiple of 4. Bank 0 is one
+  // horizontal SignalBlock: a time series, one float per frame. A bank of N voices at
+  // register r occupies registers r..r+N-1 as N/4 madronalib SignalBlock4s in the
+  // "vertical" layout: one float4 per frame holding four voices, so voice v of the
+  // bank is lane v%4 of group v/4:
+  //
+  //   register r      (group 0)   v0[0] v1[0] v2[0] v3[0]  v0[1] v1[1] v2[1] v3[1] ...
+  //   register r+4    (group 1)   v4[0] v5[0] v6[0] v7[0]  ...
+  //
+  // Elementwise operators are layout-blind: with a bank size they apply to N
+  // registers in turn, which is correct for both layouts. Time-dependent operators
+  // (ramps, gates, filters, generators) and layout operators (SPREAD, MIX, BANK,
+  // UNBANK) know the arrangement. Control-rate operators with a bank size write banks
+  // directly, and read a one-float row (a controller) broadcast to every lane.
+  static constexpr size_t kLanes{4};
+  static constexpr size_t kMaxBankVoices{kEventVoices};   // a control row has 16 voices
 
   enum class HostInput : uint8_t { audioIn, audioOut, events, controllers };
 

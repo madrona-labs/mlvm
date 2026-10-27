@@ -389,19 +389,169 @@ void testControlRate() {
   CHECK(allFramesEqual(vm.registers[2], 3.f));
   vm.unbindArenas();
 
-  // bank of two voices: LOAD_G.2 fills r1 and r2 from voices 0 and 1
-  auto rBank = assemble("EXTERN events0 16\nARENA kstate 16\nLOAD_G.2 r1, events0/1, kstate/0\nHALT\n");
-  CHECK(rBank.ok());
-  MLVM vmBank;
-  CHECK(vmBank.loadProgram(rBank.program));
-  std::vector<float> events2(MLVM::kEventRows * MLVM::kEventVoices, 0.f);
-  events2[1 * 16 + 0] = ml::encodeGateTransition(true, 0);
-  events2[1 * 16 + 1] = ml::encodeGateTransition(true, 10);
-  CHECK(vmBank.bindArena(0, events2.data(), events2.size(), false));
-  vmBank.run();
-  CHECK(allFramesEqual(vmBank.registers[1], 1.f));
-  for (size_t i = 0; i < 10; ++i) CHECK(vmBank.registers[2][i] == 0.f);
-  for (size_t i = 10; i < kFrames; ++i) CHECK(vmBank.registers[2][i] == 1.f);
+}
+
+// ---- banks
+
+void testBankErrors() {
+  using namespace mlvm;
+  auto r = assemble(
+    "ADD.3 r0, r1, r2\n"        // 1: not a multiple of 4
+    "ADD.5 r0, r1, r2\n"        // 2: not a multiple of 4
+    "ADD.8 r250, r1, r2\n"      // 3: bank runs past r255
+    "ADD.8 r0, r252, r2\n"      // 4: source bank runs past r255
+    "ADD.4 r0, r1, r2\n"        // 5: fine
+    "ADD.252 r0, r1, r2\n"      // 6: fine, exactly fits
+    "HALT\n");
+  CHECK(!r.ok());
+  CHECK_EQ(r.errors.size(), 4u);
+  for (int line : {1, 2, 3, 4}) {
+    if (!hasErrorOnLine(r, line)) { ++failures; std::printf("FAIL: expected an error on line %d\n", line); }
+  }
+  if (r.errors.size() != 4) printErrors(r);
+}
+
+void testBankLayout() {
+  using namespace mlvm;
+  // 8 horizontal voices in r0..r7, distinct ramps; BANK.8 into r16..r23 must match
+  // madronalib's horizontalToVertical byte for byte; UNBANK.8 into r32 round-trips.
+  auto r = assemble("BANK.8 r16, r0\nUNBANK.8 r32, r16\nHALT\n");
+  if (!r.ok()) printErrors(r);
+  CHECK(r.ok());
+  MLVM vm;
+  CHECK(vm.loadProgram(r.program));
+
+  ml::SignalBlockArray<8> h;
+  for (size_t v = 0; v < 8; ++v) {
+    for (size_t i = 0; i < kFrames; ++i) vm.registers[v][i] = static_cast<float>(v * 1000 + i);
+    h.setRow(v, vm.registers[v]);
+  }
+  vm.run();
+
+  ml::SignalBlockArrayBase<float4, 2> expected = ml::horizontalToVertical<2>(h);
+  CHECK(std::memcmp(vm.registers[16].data(), expected.data(), 8 * kFrames * sizeof(float)) == 0);
+
+  // voice v, frame i sits at lane v%4 of float4 frame i of group v/4
+  CHECK(vm.registers[16][0 * 4 + 1] == 1000.f);          // voice 1, frame 0
+  CHECK(vm.registers[16][5 * 4 + 2] == 2005.f);          // voice 2, frame 5
+  CHECK(vm.registers[20][3 * 4 + 0] == 4003.f);          // voice 4, frame 3 (group 1)
+
+  for (size_t v = 0; v < 8; ++v) CHECK(vm.registers[32 + v] == vm.registers[v]);
+}
+
+void testElementwiseBank() {
+  using namespace mlvm;
+  auto r = assemble("ADD.8 r0, r16, r24\nNEG.4 r40, r16\nHALT\n");
+  CHECK(r.ok());
+  MLVM vm;
+  CHECK(vm.loadProgram(r.program));
+  for (size_t k = 0; k < 8; ++k) {
+    vm.registers[16 + k] = ml::SignalBlock(static_cast<float>(k));
+    vm.registers[24 + k] = ml::SignalBlock(100.f);
+  }
+  vm.run();
+  for (size_t k = 0; k < 8; ++k) CHECK(allFramesEqual(vm.registers[k], 100.f + k));
+  for (size_t k = 0; k < 4; ++k) CHECK(allFramesEqual(vm.registers[40 + k], -static_cast<float>(k)));
+  CHECK(allFramesEqual(vm.registers[44], 0.f));   // untouched beyond the bank
+}
+
+void testVerticalControl() {
+  using namespace mlvm;
+  // a 16-voice bank of pitches ramps per voice; UNBANK lets us check each voice.
+  auto r = assemble(R"(
+    EXTERN events0 16
+    ARENA  kstate 32
+    LOAD_K.16  r16, events0/0, kstate/0      // 16 pitches -> vertical bank r16..r31
+    UNBANK.16  r32, r16                      // -> horizontal voices r32..r47
+    LOAD_G.8   r48, events0/1, kstate/1      // 8 gates -> vertical bank r48..r55
+    UNBANK.8   r56, r48
+    LOAD_KS.4  r64, r48, events0/2, kstate/2 // 4 velocities stepping at their gates
+    UNBANK.4   r68, r64
+    HALT
+  )");
+  if (!r.ok()) printErrors(r);
+  CHECK(r.ok());
+  MLVM vm;
+  CHECK(vm.loadProgram(r.program));
+
+  std::vector<float> events(MLVM::kEventRows * MLVM::kEventVoices, 0.f);
+  CHECK(vm.bindArena(0, events.data(), events.size(), false));
+  for (size_t v = 0; v < 16; ++v) events[0 * 16 + v] = static_cast<float>(v + 1);       // pitch
+  for (size_t v = 0; v < 8; ++v) events[1 * 16 + v] = ml::encodeGateTransition(true, v * 2); // gate rises at 0,2,4..
+  for (size_t v = 0; v < 4; ++v) events[2 * 16 + v] = 0.5f + 0.1f * v;                   // velocity
+
+  const size_t ramp = std::min(MLVM::kControlRampFrames, kFrames);
+  vm.run();
+
+  // pitch: each voice ramps from 0 to v+1 over `ramp` frames, then holds
+  for (size_t v = 0; v < 16; ++v) {
+    const ml::SignalBlock& p = vm.registers[32 + v];
+    const float target = static_cast<float>(v + 1);
+    CHECK(std::fabs(p[0] - target / ramp) < 1e-5f);
+    CHECK(p[ramp - 1] == target);
+    CHECK(p[kFrames - 1] == target);
+  }
+  // gates: voice v rises at frame 2v
+  for (size_t v = 0; v < 8; ++v) {
+    const ml::SignalBlock& g = vm.registers[56 + v];
+    for (size_t i = 0; i < kFrames; ++i) CHECK(g[i] == (i >= 2 * v ? 1.f : 0.f));
+  }
+  // velocities: held at 0 (zero state) until each voice's gate rise, then the value
+  for (size_t v = 0; v < 4; ++v) {
+    const ml::SignalBlock& vel = vm.registers[68 + v];
+    const float value = 0.5f + 0.1f * v;
+    for (size_t i = 0; i < kFrames; ++i) CHECK(vel[i] == (i >= 2 * v ? value : 0.f));
+  }
+
+  // second block: no gate transitions, pitches unchanged -> flat; velocities flat
+  for (size_t v = 0; v < 8; ++v) events[1 * 16 + v] = ml::kNoGateTransition;
+  vm.run();
+  for (size_t v = 0; v < 16; ++v) CHECK(allFramesEqual(vm.registers[32 + v], static_cast<float>(v + 1)));
+  for (size_t v = 0; v < 8; ++v) CHECK(allFramesEqual(vm.registers[56 + v], 1.f));
+  for (size_t v = 0; v < 4; ++v) CHECK(allFramesEqual(vm.registers[68 + v], 0.5f + 0.1f * v));
+
+  // a 32-voice request on a 16-voice row is refused (registers untouched)
+  auto big = assemble("EXTERN events0 16\nARENA kstate 32\nLOAD_K.32 r16, events0/0, kstate/0\nHALT\n");
+  CHECK(big.ok());
+  MLVM vm2;
+  CHECK(vm2.loadProgram(big.program));
+  CHECK(vm2.bindArena(0, events.data(), events.size(), false));
+  vm2.registers[16] = ml::SignalBlock(9.f);
+  vm2.run();
+  CHECK(allFramesEqual(vm2.registers[16], 9.f));
+}
+
+void testBroadcastAndMix() {
+  using namespace mlvm;
+  auto r = assemble(R"(
+    EXTERN ctl0 1
+    ARENA  kstate 16
+    LOAD_K.16  r16, ctl0/1, kstate/0     // one controller broadcast to 16 voices
+    SPREAD.16  r32, r1                   // horizontal r1 to all 16 voices
+    MUL.16     r48, r16, r32
+    MIX.16     r8, r48                   // sum of 16 voices
+    HALT
+  )");
+  if (!r.ok()) printErrors(r);
+  CHECK(r.ok());
+  MLVM vm;
+  CHECK(vm.loadProgram(r.program));
+  std::vector<float> ctl(MLVM::kNumControllers, 0.f);
+  ctl[1] = 0.5f;
+  CHECK(vm.bindArena(0, ctl.data(), ctl.size(), false));
+  for (size_t i = 0; i < kFrames; ++i) vm.registers[1][i] = static_cast<float>(i);
+
+  const size_t ramp = std::min(MLVM::kControlRampFrames, kFrames);
+  vm.run();
+  // after the ramp every voice holds 0.5 * i, so the mix is 16 * 0.5 * i = 8i
+  for (size_t i = ramp; i < kFrames; ++i) CHECK(std::fabs(vm.registers[8][i] - 8.f * i) < 1e-3f);
+  // during the ramp the controller is at 0.5 * (i+1)/ramp in every lane
+  CHECK(std::fabs(vm.registers[8][0] - 16.f * (0.5f / ramp) * 0.f) < 1e-5f);
+  CHECK(std::fabs(vm.registers[8][1] - 16.f * (0.5f * 2.f / ramp) * 1.f) < 1e-4f);
+  // SPREAD put frame i of r1 in all four lanes of every group
+  CHECK(vm.registers[32][3 * 4 + 0] == 3.f);
+  CHECK(vm.registers[32][3 * 4 + 3] == 3.f);
+  CHECK(vm.registers[44][7 * 4 + 2] == 7.f);
 }
 
 } // namespace
@@ -416,6 +566,11 @@ int main() {
   testExternArenas();
   testControllers();
   testControlRate();
+  testBankErrors();
+  testBankLayout();
+  testElementwiseBank();
+  testVerticalControl();
+  testBroadcastAndMix();
 
   if (failures == 0) {
     std::printf("mlvm tests: all passed\n");
