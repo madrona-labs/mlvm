@@ -313,6 +313,7 @@ endfunction()
 
 if(BUILD_EXAMPLES)
     make_example(Example0 example0.cpp)
+    make_example(SimpleSynth simplesynth.cpp)
 endif()
 
 #--------------------------------------------------------------------

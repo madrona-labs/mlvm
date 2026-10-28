@@ -7,6 +7,8 @@
 #include <cstring>
 
 #include "MLAudioContext.h"
+#include "MLDSPFilters.h"
+#include "MLDSPGens.h"
 
 // a using-directive is fine here in the .cpp: it only affects this translation unit.
 using namespace ml;
@@ -115,6 +117,29 @@ inline int findRise(const SignalBlock& gate, bool prevLevel) {
     prev = high;
   }
   return -1;
+}
+
+// ---- generators and filters
+
+// log pitch in octaves (0 = A440) -> omega in cycles per sample, clamped to the range
+// the filters accept. scale = 440 / sampleRate.
+inline float4 pitchToOmega4(float4 pitch, float scale) {
+  return clamp(expApprox(kLogTwoVec * pitch) * float4(scale), float4(kOmegaMin), float4(kOmegaMax));
+}
+
+// one-pole coefficient for a time constant in seconds; time <= 0 means instant.
+inline float onePoleCoeff(float timeInSeconds, double sampleRate) {
+  if (timeInSeconds <= 0.f) return 1.f;
+  return 1.f - std::exp(-1.f / (timeInSeconds * static_cast<float>(sampleRate)));
+}
+
+// Bank 0 (one horizontal voice) runs the same float4 code as a bank group with the
+// voice's values broadcast to all lanes and lane 0 kept. That keeps one implementation
+// per operator and makes bank 0 bit-identical to lane 0 of a bank.
+inline float lane0(float4 v) {
+  alignas(16) float tmp[4];
+  storeFloat4(tmp, v);
+  return tmp[0];
 }
 
 } // anonymous namespace
@@ -449,16 +474,112 @@ void MLVM::run() {
       }
 
       // ---- generators and filters
-      // TODO: stateful operators need params (fields 4,5) and state (fields 6,7)
-      // in the arena. Until the state layouts are defined these pass src1 through.
-      // They can take per-block params straight from a control row, one float4 per
-      // group, as madronalib's GenBank does.
-      case SAW:
-      case SVF:
-        (void)b6; (void)b7;
-        if (!inRange(b1, n) || !inRange(b2, n)) break;
-        for (size_t k = 0; k < n; ++k) registers[b1 + k] = registers[b2 + k];
+      // Per-voice state is variable-major in the chunk: variable k of voice v at
+      // chunk[k * n + v]. The sample rate comes from processBlock() or the test.
+      case SAW: {
+        // polyBLEP sawtooth at the pitch in src1. state: phase per voice.
+        float* phase = getArenaPtr(b6, b7, 0, n);
+        if (!phase || !inRange(b1, n) || !inRange(b2, n)) break;
+        const float scale = 440.f / static_cast<float>(sampleRate);
+        if (!banked) {
+          const SignalBlock& pitch = registers[b2];
+          SignalBlock out;
+          float4 ph4(phase[0]);
+          for (size_t i = 0; i < kFrames; ++i) {
+            const float4 om = pitchToOmega4(float4(pitch[i]), scale);
+            ph4 = fracPart(ph4 + om);
+            out[i] = lane0(phasorToSawSample(ph4, om));
+          }
+          phase[0] = lane0(ph4);
+          registers[b1] = out;
+          break;
+        }
+        for (size_t g = 0; g < groups; ++g) {
+          const float* in = regPtr(b2) + g * kLanes * kFrames;
+          float* out = regPtr(b1) + g * kLanes * kFrames;
+          float4 ph4 = gather4(phase + g * kLanes);
+          for (size_t i = 0; i < kFrames; ++i) {
+            const float4 om = pitchToOmega4(loadFloat4(in + i * kLanes), scale);
+            ph4 = fracPart(ph4 + om);
+            storeFloat4(out + i * kLanes, phasorToSawSample(ph4, om));
+          }
+          scatter4(phase + g * kLanes, ph4);
+        }
         break;
+      }
+      case SVF: {
+        // lowpass state variable filter: in = src1, cutoff pitch = src2, k = 1/Q = src3,
+        // all audio rate. Coefficients are recomputed every frame as madronalib's
+        // signal-rate path does (two sin() per frame per group). TODO: a reduced-rate
+        // coefficient update is an easy optimization. state: ic1eq[n] ic2eq[n].
+        float* state = getArenaPtr(b6, b7, 0, 2 * n);
+        if (!state || !inRange(b1, n) || !inRange(b2, n) || !inRange(b4, n) || !inRange(b5, n)) break;
+        const float scale = 440.f / static_cast<float>(sampleRate);
+        if (!banked) {
+          const SignalBlock& x = registers[b2];
+          const SignalBlock& cutoff = registers[b4];
+          const SignalBlock& kIn = registers[b5];
+          SignalBlock out;
+          Lopass<float4> f;
+          f.state = {float4(state[0]), float4(state[1])};
+          for (size_t i = 0; i < kFrames; ++i) {
+            const auto c = Lopass<float4>::makeCoeffs({pitchToOmega4(float4(cutoff[i]), scale), float4(kIn[i])});
+            out[i] = lane0(f.nextFrame(float4(x[i]), c));
+          }
+          state[0] = lane0(f.state[0]);
+          state[1] = lane0(f.state[1]);
+          registers[b1] = out;
+          break;
+        }
+        for (size_t g = 0; g < groups; ++g) {
+          const float* in = regPtr(b2) + g * kLanes * kFrames;
+          const float* cutoff = regPtr(b4) + g * kLanes * kFrames;
+          const float* kIn = regPtr(b5) + g * kLanes * kFrames;
+          float* out = regPtr(b1) + g * kLanes * kFrames;
+          Lopass<float4> f;
+          f.state = {gather4(state + g * kLanes), gather4(state + n + g * kLanes)};
+          for (size_t i = 0; i < kFrames; ++i) {
+            const auto c = Lopass<float4>::makeCoeffs({pitchToOmega4(loadFloat4(cutoff + i * kLanes), scale),
+                                                        loadFloat4(kIn + i * kLanes)});
+            storeFloat4(out + i * kLanes, f.nextFrame(loadFloat4(in + i * kLanes), c));
+          }
+          scatter4(state + g * kLanes, f.state[0]);
+          scatter4(state + n + g * kLanes, f.state[1]);
+        }
+        break;
+      }
+      case ONEPOLE: {
+        // one-pole lowpass smoother: in = src1, time constant in seconds = src2, read at
+        // frame 0 of the block per voice (the time is not modulated within a block).
+        // Doubles as the glide for controllers and the attack/release for gates.
+        // state: y per voice. In place (dest == src) is fine.
+        float* y = getArenaPtr(b6, b7, 0, n);
+        if (!y || !inRange(b1, n) || !inRange(b2, n) || !inRange(b4, n)) break;
+        if (!banked) {
+          const float kc = onePoleCoeff(registers[b4][0], sampleRate);
+          const SignalBlock& x = registers[b2];
+          SignalBlock out;
+          float yv = y[0];
+          for (size_t i = 0; i < kFrames; ++i) { yv += kc * (x[i] - yv); out[i] = yv; }
+          y[0] = yv;
+          registers[b1] = out;
+          break;
+        }
+        for (size_t g = 0; g < groups; ++g) {
+          const float* in = regPtr(b2) + g * kLanes * kFrames;
+          const float* time = regPtr(b4) + g * kLanes * kFrames;
+          float* out = regPtr(b1) + g * kLanes * kFrames;
+          const float4 kc(onePoleCoeff(time[0], sampleRate), onePoleCoeff(time[1], sampleRate),
+                          onePoleCoeff(time[2], sampleRate), onePoleCoeff(time[3], sampleRate));
+          float4 y4 = gather4(y + g * kLanes);
+          for (size_t i = 0; i < kFrames; ++i) {
+            y4 = y4 + kc * (loadFloat4(in + i * kLanes) - y4);
+            storeFloat4(out + i * kLanes, y4);
+          }
+          scatter4(y + g * kLanes, y4);
+        }
+        break;
+      }
 
       default:
         // TODO: remaining opcodes are no-ops until implemented.
@@ -472,6 +593,9 @@ void MLVM::run() {
 // context has finished event processing for this block before calling us, so the
 // voice controls and controller values are stable while we run.
 void MLVM::processBlock(AudioContext* context) {
+  const double sr = context->getSampleRate();
+  if (sr > 0.) sampleRate = sr;
+
   for (const auto& b : externals) {
     switch (b.kind) {
       case HostInput::audioIn: {

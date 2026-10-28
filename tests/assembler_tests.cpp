@@ -554,6 +554,233 @@ void testBroadcastAndMix() {
   CHECK(vm.registers[44][7 * 4 + 2] == 7.f);
 }
 
+// ---- generators and filters
+
+// reference to voice v, frame i of a vertical bank starting at register r
+float& bankFloat(mlvm::MLVM& vm, size_t r, size_t v, size_t i) {
+  const size_t f = (v / 4) * 4 * kFrames + i * 4 + (v % 4);
+  return vm.registers[r + f / kFrames][f % kFrames];
+}
+
+// count downward wraps of a sawtooth across a series of samples
+int countWraps(const std::vector<float>& s) {
+  int wraps = 0;
+  for (size_t i = 1; i < s.size(); ++i) if (s[i] < s[i - 1] - 1.f) ++wraps;
+  return wraps;
+}
+
+void testSvfEncoding() {
+  using namespace mlvm;
+  auto r = assemble("ARENA kstate 32\nSVF.4 r0, r4, r8, r12, kstate/5\nONEPOLE r1, r2, r3, kstate/6\nSAW r1, r2, kstate/7\nHALT\n");
+  if (!r.ok()) printErrors(r);
+  CHECK(r.ok());
+  if (r.program.instructions.size() < 3) { ++failures; return; }
+  CHECK((r.program.instructions[0] == Instruction{SVF, 0, 4, 4, 8, 12, 0, 5}));
+  CHECK((r.program.instructions[1] == Instruction{ONEPOLE, 1, 2, 0, 3, 0, 0, 6}));
+  // a lone arena ref on a stateful op is its state: fields 6,7, not 4,5
+  CHECK((r.program.instructions[2] == Instruction{SAW, 1, 2, 0, 0, 0, 0, 7}));
+  // a stateful op without a state chunk is an error; LOAD's lone ref still lands in 4,5
+  auto bad = assemble("SAW r1, r2\n");
+  CHECK(!bad.ok());
+  auto load = assemble("ARENA a 64\nLOAD r1, a/3\n");
+  CHECK(load.ok());
+  CHECK((load.program.instructions[0] == Instruction{LOAD, 1, 0, 0, 0, 3, 0, 0}));
+}
+
+void testSaw() {
+  using namespace mlvm;
+  auto r = assemble(R"(
+    ARENA kstate 32
+    SAW.4    r16, r32, kstate/0     // 4 voices at the pitches in the bank at r32
+    UNBANK.4 r40, r16
+    SAW      r1, r2, kstate/1       // one horizontal voice at the pitch in r2
+    HALT
+  )");
+  if (!r.ok()) printErrors(r);
+  CHECK(r.ok());
+  MLVM vm;
+  vm.sampleRate = 48000.0;
+  CHECK(vm.loadProgram(r.program));
+  for (size_t i = 0; i < kFrames; ++i) {
+    bankFloat(vm, 32, 0, i) = 0.f;    // A440
+    bankFloat(vm, 32, 1, i) = 1.f;    // 880
+    bankFloat(vm, 32, 2, i) = -1.f;   // 220
+    bankFloat(vm, 32, 3, i) = 0.f;
+  }
+  vm.registers[2] = ml::SignalBlock(0.f);
+
+  const int blocks = 16;
+  std::vector<float> v0, v1, v2, h;
+  for (int b = 0; b < blocks; ++b) {
+    vm.run();
+    for (size_t i = 0; i < kFrames; ++i) {
+      v0.push_back(vm.registers[40][i]);
+      v1.push_back(vm.registers[41][i]);
+      v2.push_back(vm.registers[42][i]);
+      h.push_back(vm.registers[1][i]);
+    }
+  }
+  const float frames = static_cast<float>(blocks * kFrames);
+  const int expect440 = static_cast<int>(frames * 440.f / 48000.f);
+  CHECK(std::abs(countWraps(v0) - expect440) <= 1);
+  CHECK(std::abs(countWraps(v1) - 2 * expect440) <= 1);
+  CHECK(std::abs(countWraps(v2) - expect440 / 2) <= 1);
+  for (float s : v0) CHECK(s >= -1.2f && s <= 1.2f);
+  // rising between wraps
+  int falls = 0;
+  for (size_t i = 1; i < v0.size(); ++i) if (v0[i] < v0[i - 1] && v0[i] > v0[i - 1] - 1.f) ++falls;
+  CHECK(falls <= countWraps(v0) * 2);   // only the polyBLEP corrections near each wrap
+  // bank 0 is bit-identical to lane 0 of the bank at the same pitch
+  CHECK(h == v0);
+}
+
+void testSvf() {
+  using namespace mlvm;
+  auto r = assemble(R"(
+    ARENA kstate 32
+    LOAD_I.4 r20, 0.0f               // cutoff pitch: A440
+    LOAD_I.4 r24, 1.0f               // k = 1/Q
+    SVF.4    r28, r16, r20, r24, kstate/0
+    UNBANK.4 r32, r28
+    SVF      r1, r2, r3, r4, kstate/1
+    HALT
+  )");
+  if (!r.ok()) printErrors(r);
+  CHECK(r.ok());
+  MLVM vm;
+  vm.sampleRate = 48000.0;
+  CHECK(vm.loadProgram(r.program));
+
+  // DC in: every lane settles to 1
+  for (size_t k = 0; k < 4; ++k) vm.registers[16 + k] = ml::SignalBlock(1.f);
+  vm.registers[2] = ml::SignalBlock(1.f);
+  vm.registers[3] = ml::SignalBlock(0.f);
+  vm.registers[4] = ml::SignalBlock(1.f);
+  for (int b = 0; b < 40; ++b) vm.run();
+  for (size_t v = 0; v < 4; ++v) CHECK(std::fabs(vm.registers[32 + v][kFrames - 1] - 1.f) < 0.01f);
+  CHECK(vm.registers[1] == vm.registers[32]);   // bank 0 matches lane 0
+
+  // Nyquist in: strongly attenuated
+  for (size_t i = 0; i < kFrames; ++i) {
+    const float s = (i % 2) ? -1.f : 1.f;
+    for (size_t v = 0; v < 4; ++v) bankFloat(vm, 16, v, i) = s;
+    vm.registers[2][i] = s;
+  }
+  for (int b = 0; b < 40; ++b) vm.run();
+  for (size_t v = 0; v < 4; ++v) for (size_t i = 0; i < kFrames; ++i) CHECK(std::fabs(vm.registers[32 + v][i]) < 0.1f);
+  for (size_t i = 0; i < kFrames; ++i) CHECK(std::fabs(vm.registers[1][i]) < 0.1f);
+}
+
+void testOnePole() {
+  using namespace mlvm;
+  auto r = assemble(R"(
+    ARENA kstate 16
+    LOAD_I.4  r16, 1.0f              // step input
+    ONEPOLE.4 r24, r16, r20, kstate/0
+    UNBANK.4  r28, r24
+    HALT
+  )");
+  if (!r.ok()) printErrors(r);
+  CHECK(r.ok());
+  MLVM vm;
+  vm.sampleRate = 48000.0;
+  CHECK(vm.loadProgram(r.program));
+  for (size_t i = 0; i < kFrames; ++i) {
+    bankFloat(vm, 20, 0, i) = 0.01f;   // 10 ms
+    bankFloat(vm, 20, 1, i) = 0.05f;   // 50 ms
+    bankFloat(vm, 20, 2, i) = 0.f;     // instant
+    bankFloat(vm, 20, 3, i) = 0.01f;
+  }
+  std::vector<float> y0, y1, y2;
+  while (y0.size() < 2400) {
+    vm.run();
+    for (size_t i = 0; i < kFrames; ++i) {
+      y0.push_back(vm.registers[28][i]);
+      y1.push_back(vm.registers[29][i]);
+      y2.push_back(vm.registers[30][i]);
+    }
+  }
+  CHECK(std::fabs(y0[479] - 0.632f) < 0.632f * 0.05f);      // one time constant
+  CHECK(y0[2399] > 0.99f);
+  CHECK(std::fabs(y1[2399] - 0.632f) < 0.632f * 0.05f);     // 50 ms: one time constant at 2400
+  CHECK(y2[0] == 1.f);                                       // instant
+}
+
+// the Simple Synth program, as in examples/simplesynth.cpp
+std::string simpleSynthProgram() {
+  return
+    "EXTERN audioout " + kFramesStr + "\n" + R"(
+    EXTERN events0 16
+    EXTERN ctl0 1
+    ARENA  kstate 32
+    LOAD_G.16   r16, events0/1, kstate/0        // gates
+    LOAD_KS.16  r32, r16, events0/0, kstate/1   // pitch, stepping at onsets
+    LOAD_KS.16  r48, r16, events0/2, kstate/2   // velocity
+    LOAD_K.16   r64, ctl0/1, kstate/3           // mod wheel, broadcast to every voice
+    SAW.16      r80, r32, kstate/4
+    LOAD_I.16   r96, 4.0f
+    MUL.16      r96, r64, r96                   // mod * 4 octaves
+    ADD.16      r96, r32, r96                   // cutoff = pitch + mod * 4
+    LOAD_I.16   r112, 1.0f                      // k = 1/Q
+    SVF.16      r128, r80, r96, r112, kstate/5
+    MUL.16      r144, r16, r48                  // gate * velocity
+    LOAD_I.16   r160, 0.01f                     // 10 ms attack and release
+    ONEPOLE.16  r144, r144, r160, kstate/6
+    MUL.16      r128, r128, r144                // voice out
+    MIX.16      r8, r128
+    LOAD_I      r9, 0.1f
+    MUL         r8, r8, r9
+    STORE       r8, audioout/0
+    STORE       r8, audioout/1
+    HALT
+  )";
+}
+
+void testSimpleSynthChain() {
+  using namespace mlvm;
+  auto r = assemble(simpleSynthProgram());
+  if (!r.ok()) printErrors(r);
+  CHECK(r.ok());
+  MLVM vm;
+  vm.sampleRate = 48000.0;
+  CHECK(vm.loadProgram(r.program));
+
+  std::vector<float> out(2 * kFrames, 0.f);
+  std::vector<float> events(MLVM::kEventRows * MLVM::kEventVoices, 0.f);
+  std::vector<float> ctl(MLVM::kNumControllers, 0.f);
+  CHECK(vm.bindArena(0, out.data(), out.size(), true));
+  CHECK(vm.bindArena(1, events.data(), events.size(), false));
+  CHECK(vm.bindArena(2, ctl.data(), ctl.size(), false));
+
+  // one note on voice 0: pitch 0 (A440), velocity 1, gate rising at frame 0 of block 1
+  events[0 * 16 + 0] = 0.f;
+  events[2 * 16 + 0] = 1.f;
+  events[1 * 16 + 0] = ml::encodeGateTransition(true, 0);
+
+  std::vector<float> left;
+  float peak = 0.f;
+  for (int b = 0; b < 40; ++b) {
+    vm.run();
+    events[1 * 16 + 0] = ml::kNoGateTransition;   // held
+    for (size_t i = 0; i < kFrames; ++i) {
+      left.push_back(out[i]);
+      peak = std::max(peak, std::fabs(out[i]));
+      CHECK(out[i] == out[kFrames + i]);          // centered: both channels equal
+    }
+  }
+  CHECK(peak > 0.01f);
+  CHECK(peak < 0.2f);                              // 0.1 gain, Q = 1 adds a little near cutoff
+  // after the envelope opens, the output is a 440 Hz waveform: count its periods
+  std::vector<float> tail(left.begin() + left.size() / 2, left.end());
+  float lo = 0.f, hi = 0.f;
+  for (float s : tail) { lo = std::min(lo, s); hi = std::max(hi, s); }
+  int crossings = 0;
+  for (size_t i = 1; i < tail.size(); ++i) if ((tail[i - 1] < 0.f) != (tail[i] < 0.f)) ++crossings;
+  const float expectedPeriods = static_cast<float>(tail.size()) * 440.f / 48000.f;
+  CHECK(std::abs(crossings / 2 - static_cast<int>(expectedPeriods)) <= 2);
+  CHECK(hi > 0.f && lo < 0.f);
+}
+
 } // namespace
 
 int main() {
@@ -571,6 +798,11 @@ int main() {
   testElementwiseBank();
   testVerticalControl();
   testBroadcastAndMix();
+  testSvfEncoding();
+  testSaw();
+  testSvf();
+  testOnePole();
+  testSimpleSynthChain();
 
   if (failures == 0) {
     std::printf("mlvm tests: all passed\n");

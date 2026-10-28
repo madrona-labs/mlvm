@@ -232,7 +232,7 @@ private:
     }
     if (!operandsOk) return;
 
-    if (!encode(inst, operands)) return;
+    if (!encode(inst, operands, opcodeHasState(*op))) return;
 
     // a bank of N voices occupies N registers from each register operand.
     if (bank) {
@@ -313,14 +313,22 @@ private:
   uint8_t registerFields_{0};
 
   // Place operands into fields by kind. Returns false and reports an error if
-  // two operands claim the same field.
-  bool encode(Instruction& inst, const std::vector<Operand>& operands) {
+  // two operands claim the same field. For a stateful opcode the last arena
+  // reference is its state and always goes to fields 6,7.
+  bool encode(Instruction& inst, const std::vector<Operand>& operands, bool hasState) {
     static constexpr uint8_t kRegisterSlots[] = {1, 2, 4, 5};
     static constexpr uint8_t kArenaSlots[][2] = {{4, 5}, {6, 7}};
     size_t nextRegister = 0;
-    size_t nextArena = 0;
     uint8_t used = 0;   // bitmask of fields written
     registerFields_ = 0;
+
+    size_t nArenaRefs = 0;
+    for (const auto& operand : operands) if (std::get_if<ArenaRef>(&operand)) ++nArenaRefs;
+    size_t arenaRefsSeen = 0;
+    if (hasState && nArenaRefs == 0) {
+      error("this instruction keeps state and needs a state chunk, e.g. kstate/0");
+      return false;
+    }
 
     auto claim = [&](uint8_t field) {
       if (used & (1 << field)) {
@@ -339,8 +347,23 @@ private:
         inst[field] = r->idx;
         registerFields_ |= (1 << field);
       } else if (auto* a = std::get_if<ArenaRef>(&operand)) {
-        if (nextArena >= 2) { error("too many arena operands"); return false; }
-        const auto& slots = kArenaSlots[nextArena++];
+        // the state ref of a stateful op goes to fields 6,7. Any other arena ref takes
+        // the first field pair that is still free (fields 4,5 unless registers hold
+        // them, as in SVF: in, cutoff, k).
+        ++arenaRefsSeen;
+        const bool isState = hasState && (arenaRefsSeen == nArenaRefs);
+        int pair = -1;
+        if (isState) {
+          pair = 1;
+        } else {
+          const int lastPair = hasState ? 0 : 1;   // pair 1 is reserved for the state
+          for (int p = 0; p <= lastPair && pair < 0; ++p) {
+            const auto& slots = kArenaSlots[p];
+            if (!(used & (1 << slots[0])) && !(used & (1 << slots[1]))) pair = p;
+          }
+        }
+        if (pair < 0) { error("too many operands: no field pair is free for an arena reference"); return false; }
+        const auto& slots = kArenaSlots[pair];
         if (!claim(slots[0]) || !claim(slots[1])) return false;
         inst[slots[0]] = a->arena;
         inst[slots[1]] = a->chunk;

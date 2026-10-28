@@ -104,7 +104,9 @@ Chunk of the arena for ops with arena-stored states, or low bits of 16-bit jump 
 | **One-input math** (SIN, LOG, EXP, NEG, ABS...) | op | dest | src1 | bank size | `[unused]` | `[unused]` | `[unused]` | `[unused]` |
 | **Two-input math** (ADD, ADD\_WRAP, MUL, MIN...) | op | dest | src1 | bank size | src2 | `[unused]` | `[unused]` | `[unused]` |
 | **Three-input math** (LERP, CLAMP, SELECT...) | op | dest | src1 | bank size | src2 | src3 | `[unused]` | `[unused]` |
-| **Filters/Gens** (SAW, SINE, SVF, ADSR, DELAY (*1)...) | op | dest | src1 | bank size | params arena | params chunk | state arena | state chunk |
+| **Generators** (SAW, SINE...) | op | dest | src1 (pitch) | bank size | `[unused]` | `[unused]` | state arena | state chunk |
+| **Filters** (SVF, ONEPOLE, FOUR\_POLE...) | op | dest | src1 (in) | bank size | src2 | src3 | state arena | state chunk |
+| **Filters/Gens with per-block params** (ADSR, DELAY (*1)...) | op | dest | src1 | bank size | params arena | params chunk | state arena | state chunk |
 | **Projections** (PROJ) (*2) | op | dest | src1 | bank size | params arena | params chunk | proj. type | `[unused]` |
 | **Memory access** (LOAD\_I, MOV...) (*3) | op | dest | src1 | `[unused]` | immed. 24:31 | immed. 16:23 | immed. 8:15 | immed. 0:7 |
 | **Arena access** (LOAD, STORE, ...) (*3) | op | dest | src1 | `[unused]` | src1 arena | src1 chunk | dest arena | dest chunk |
@@ -114,6 +116,10 @@ Chunk of the arena for ops with arena-stored states, or low bits of 16-bit jump 
 
 
 **(*1) Delays** — Delay state objects include internal state (playhead position, internal filters, etc.) as well as the buffer memory itself.
+
+**Pitch and parameters** — Pitch-like inputs (SAW's pitch, SVF's cutoff) are log pitch in octaves with 0 \= A440, madronalib's convention. The operators convert to omega internally, so cutoff modulation is octave arithmetic: `cutoff = pitch + mod × 4`. Filters take all their parameters at audio rate from register banks (`SVF.16 dest, in, cutoffPitch, k, state`), so anything can modulate anything; a constant is one `LOAD_I.16`. ONEPOLE's time in seconds is read at frame 0 of each block. Two assembler rules make this fit the fields. The opcode list carries one flag per opcode, "keeps state"; for such an opcode the last arena reference is its state and always goes to fields 6,7, so `SAW r1, r2, kstate/0` and `SVF.16 d, in, cutoff, k, kstate/5` both put the state where the VM reads it. Any other arena reference takes the first free pair. This flag is the first per-opcode column in the opcode list; it was added when SAW, with one arena reference, showed that no purely positional rule can serve both LOAD (data in 4,5) and a stateful op (state in 6,7).
+
+**State chunks** — Per-voice state is laid out variable-major in the chunk: variable k of voice v at `chunk[k × N + v]` for a bank of N, so a group's four lanes are one float4. SAW keeps one float per voice (phase), SVF two (the integrator states), ONEPOLE one. `ARENA kstate 32` holds any of these for 16 voices. The VM takes the sample rate from the AudioContext each block.
 
 **(*2) Projections** — The type field selects the projection function (256 possible). Examples: linear, logarithmic, breakpoint function, smoothstep, tanh, … Projections may have parameters and are stateless by definition.
 
@@ -278,7 +284,7 @@ A stateful operator does not always need LOAD\_K in front of it. madronalib's pr
 
 ```
 LOAD_G.4   r16, events/gate,  kstate/0
-LOAD_KS.4  r20, r16, events/pitch, kstate/1
+LOAD_KS.4  r20, r16, events0/pitch, kstate/1
 SAW.4      r24, r20, saw-params/0, saw-states/0
 ```
 
@@ -297,7 +303,7 @@ Stateful operators already carry params arena and chunk fields, so an operator d
 - Manifest section at top declaring buffers and arenas with chunk sizes  
 - One instruction per line, mnemonic \+ operands. Bank size is a mnemonic suffix: `SVF.4` is bank size 4, `SVF` is 0.  
 - Operand kind is determined by its text, and kind determines its field: registers `rN` fill fields 1, 2, 4, 5 in order; arena refs `name/chunk` fill 4,5 then 6,7; a float immediate (`42.333f`) fills 4–7; a label fills 6,7 as a pc offset.  
-- Opcodes are declared once, in an X-macro list in `mlvm.h`, which generates both the enum and the mnemonic table.  
+- Opcodes are declared once, in an X-macro list in `mlvm.h`, which generates the enum, the mnemonic table and a flags table. The one flag so far, "keeps state", tells the assembler that the instruction's last arena reference is its state chunk, fields 6,7.  
 - Output: binary program file (manifest \+ instruction stream)
 
 Example assembly language program (sketch):
@@ -314,7 +320,7 @@ ARENA delay-states 4096 // delay memory indexable in 4096-float chunks
 
 LOAD      r12, delay-params/1
 LOAD_I    r12, 42.333f
-LOAD_K.4  r16, events/pitch
+LOAD_K.4  r16, events0/pitch, kstate/0
 filter1: // a label
 SVF.4     r2, r1, svf-params/3, svf-states/3
 DELAY     r4, r3, delay-params/0, delay-states/0
@@ -331,10 +337,10 @@ Done (Oct 2026): opcode list, assembler, VM instruction loop with tests. Impleme
 The next task is **event inputs**, per "Event and control inputs" above. It spans madronalib and mlvm, with the a-rate path left on throughout:
 
 1. madronalib (branch `control-blocks`, done): `ControlSignals`, `ControlRow`, `VoiceControls`, `ControllerValues`, gate transition helpers; EventsToSignals fills them alongside its a-rate outputs; AudioContext exposes them per channel  
-2. mlvm (branch `event-inputs`, done): `EXTERN` arenas bound from the context each block (audio I/O, `events<c>`, `ctl<c>`), LOAD\_K, LOAD\_KS and LOAD\_G with per-voice state and 16-frame ramps, tests that drive the VM across several blocks through bound buffers  
-3. A glide operator with a variable time for controllers and other continuous values  
-4. Time info (tempo, beat phase, samples since start) as an external arena  
-5. Example: a bank of oscillators whose pitch comes from LOAD\_KS and whose envelope is gated by LOAD\_G (needs SAW and an envelope)  
+2. mlvm (branch `event-inputs`, done): `EXTERN` arenas bound from the context each block (audio I/O, `events<c>`, `ctl<c>`), LOAD\_K, LOAD\_KS and LOAD\_G with per-voice state and 16-frame ramps, banks in the vertical layout, SPREAD/MIX/BANK/UNBANK  
+3. Simple Synth (done): SAW (polyBLEP), SVF lowpass with audio-rate cutoff and k, ONEPOLE (envelope and glide), sample rate from the context, `examples/simplesynth.cpp` playing 16 voices from MIDI with the mod wheel opening the filter  
+4. A float4 ADSR; a reduced-rate coefficient update for SVF  
+5. Time info (tempo, beat phase, samples since start) as an external arena  
 
 After that: stateful operator state layouts (SAW, SVF), bank inner loops, time info chunk.
 
@@ -365,7 +371,7 @@ After that: stateful operator state layouts (SAW, SVF), bank inner loops, time i
 
 ## Open questions / TBD
 
-- Compare and branch semantics: exact conditions (ALL, ANY, threshold?), flag register count. CMP has sources but no dest, so the assembler's generic register placement currently puts src1 in field 1 rather than field 2. Resolve together with the semantics, either by giving CMP a dest (flag in a register) or by adding a per-opcode operand format column to the opcode list.  
+- Compare and branch semantics: exact conditions (ALL, ANY, threshold?), flag register count. CMP has sources but no dest, so the assembler's generic register placement currently puts src1 in field 1 rather than field 2. Resolve together with the semantics, either by giving CMP a dest (flag in a register) or by extending the per-opcode flags column in the opcode list (which now exists for "keeps state") with operand placement.  
 - When to turn off a-rate event signal generation in EventsToSignals once mlvm no longer reads it  
 - madronalib's per-block `Params` interpolation inside processors spans the block; it should become 16 frames to match LOAD\_K and keep sounds block-size independent  
 - Fused broadcast variants of ADD/MUL (bank × horizontal without SPREAD) only if profiles show SPREAD's extra registers matter  

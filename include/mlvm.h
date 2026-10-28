@@ -22,28 +22,38 @@ namespace mlvm {
 // ----------------------------------------------------------------
 // Opcodes
 //
-// The single source of truth for opcodes. Each X(name) line yields the enum
-// constant and the assembler mnemonic. To add an opcode, add one line here.
-// Additional per-opcode columns (operand format, etc.) can be added later.
+// The single source of truth for opcodes. Each X(name, flags) line yields the enum
+// constant, the assembler mnemonic and the opcode's flags. To add an opcode, add
+// one line here.
+//
+// Flags: kOpState marks an operator that keeps state in a chunk addressed by
+// fields 6,7. The assembler uses it to place the last arena reference of such an
+// instruction in those fields, whatever else the instruction carries. Everything
+// else about operand placement is positional (see assembler.h).
+
+enum OpFlags : uint8_t {
+  kOpNone = 0,
+  kOpState = 1,
+};
 
 #define MLVM_OPCODES(X) \
-  /* system */            X(NOOP) X(HALT) \
-  /* memory access */     X(MOVE) X(LOAD_I) X(LOAD) X(STORE) \
-  /* control rate */      X(LOAD_K) X(LOAD_KS) X(LOAD_G) \
-  /* compare and branch */X(CMP) X(BNE) X(JMP) \
-  /* one-input math */    X(SIN) X(LOG) X(EXP) X(NEG) X(ABS) X(RCP) \
-  /* two-input math */    X(ADD) X(ADD_WRAP) X(SUB) X(SUB_WRAP) X(MUL) X(DIV) \
-  /* three-input math */  X(LERP) X(CLAMP) X(SELECT) \
-  /* generators */        X(SINE) X(IMPULSE) X(SAW) X(NOISE) \
-  /* filters */           X(SVF) X(FOUR_POLE) \
-  /* layout */            X(FILL) X(SPREAD) X(MIX) X(BANK) X(UNBANK) \
-  /* misc */              X(SHIFT) X(INTERP)
+  /* system */            X(NOOP, kOpNone) X(HALT, kOpNone) \
+  /* memory access */     X(MOVE, kOpNone) X(LOAD_I, kOpNone) X(LOAD, kOpNone) X(STORE, kOpNone) \
+  /* control rate */      X(LOAD_K, kOpState) X(LOAD_KS, kOpState) X(LOAD_G, kOpState) \
+  /* compare and branch */X(CMP, kOpNone) X(BNE, kOpNone) X(JMP, kOpNone) \
+  /* one-input math */    X(SIN, kOpNone) X(LOG, kOpNone) X(EXP, kOpNone) X(NEG, kOpNone) X(ABS, kOpNone) X(RCP, kOpNone) \
+  /* two-input math */    X(ADD, kOpNone) X(ADD_WRAP, kOpNone) X(SUB, kOpNone) X(SUB_WRAP, kOpNone) X(MUL, kOpNone) X(DIV, kOpNone) \
+  /* three-input math */  X(LERP, kOpNone) X(CLAMP, kOpNone) X(SELECT, kOpNone) \
+  /* generators */        X(SINE, kOpState) X(IMPULSE, kOpState) X(SAW, kOpState) X(NOISE, kOpState) \
+  /* filters */           X(SVF, kOpState) X(ONEPOLE, kOpState) X(FOUR_POLE, kOpState) \
+  /* layout */            X(FILL, kOpNone) X(SPREAD, kOpNone) X(MIX, kOpNone) X(BANK, kOpNone) X(UNBANK, kOpNone) \
+  /* misc */              X(SHIFT, kOpState) X(INTERP, kOpNone)
   // ... and many more
   // many opcodes will be much bigger chunks of stateful work like oscillators, table lookups,
   // env followers, and in general DSP machinery.
 
 enum Opcode : uint8_t {
-#define X(name) name,
+#define X(name, flags) name,
   MLVM_OPCODES(X)
 #undef X
   NUM_OPCODES
@@ -53,15 +63,26 @@ enum Opcode : uint8_t {
 static_assert(NUM_OPCODES < (1 << 8));
 
 inline constexpr std::string_view kOpcodeNames[] = {
-#define X(name) #name,
+#define X(name, flags) #name,
+  MLVM_OPCODES(X)
+#undef X
+};
+
+inline constexpr uint8_t kOpcodeFlags[] = {
+#define X(name, flags) flags,
   MLVM_OPCODES(X)
 #undef X
 };
 
 static_assert(sizeof(kOpcodeNames) / sizeof(kOpcodeNames[0]) == NUM_OPCODES);
+static_assert(sizeof(kOpcodeFlags) / sizeof(kOpcodeFlags[0]) == NUM_OPCODES);
 
 constexpr std::string_view opcodeName(Opcode op) {
   return op < NUM_OPCODES ? kOpcodeNames[op] : std::string_view("?");
+}
+
+constexpr bool opcodeHasState(Opcode op) {
+  return op < NUM_OPCODES && (kOpcodeFlags[op] & kOpState);
 }
 
 // linear scan: this is only used at assemble time, never on the audio thread.
@@ -238,6 +259,21 @@ struct MLVM {
   // directly, and read a one-float row (a controller) broadcast to every lane.
   static constexpr size_t kLanes{4};
   static constexpr size_t kMaxBankVoices{kEventVoices};   // a control row has 16 voices
+
+  // Generators and filters. Pitch-like inputs are log pitch in octaves, 0 = A440,
+  // madronalib's convention; the operators convert to omega (cycles per sample)
+  // internally, so cutoff modulation is plain octave arithmetic. Their per-voice
+  // state lives in a chunk the program declares, laid out variable-major: variable
+  // k of voice v is at chunk[k * N + v] for a bank of N (N = 1 for bank 0), so a
+  // group's four lanes are contiguous.
+  //   SAW.N     dest, pitch, state/chunk             polyBLEP sawtooth. state: phase (N floats)
+  //   SVF.N     dest, in, cutoffPitch, k, state/chunk lowpass SVF, k = 1/Q, all audio rate.
+  //                                                  state: ic1eq[N] ic2eq[N] (2N floats)
+  //   ONEPOLE.N dest, in, time, state/chunk          one-pole lowpass, time in seconds read
+  //                                                  at frame 0 of each block. state: y (N)
+  // The sample rate is needed for all of these; processBlock() takes it from the
+  // AudioContext every block, and tests set it directly.
+  double sampleRate{48000.0};
 
   enum class HostInput : uint8_t { audioIn, audioOut, events, controllers };
 
