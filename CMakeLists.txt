@@ -228,7 +228,12 @@ message("mlvm headers destination: " ${INCLUDES_INSTALL_DIR} )
 
 set(ML_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
 
+# make_example(<name> <source> [AUDIO_INPUT])
+#
+# AUDIO_INPUT: the example reads audio input, so on macOS its bundle needs the
+# microphone usage description. Everything else must not claim the microphone.
 function(MAKE_EXAMPLE EXAMPLE_APP_NAME EXAMPLE_SOURCE_FILE)
+    cmake_parse_arguments(EXAMPLE "AUDIO_INPUT" "" "" ${ARGN})
 
     set(
         EXAMPLE_SOURCES
@@ -290,18 +295,16 @@ endif()
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     )
 
-    # get directory of .app package Contents
-    set(PACKAGE_DIR
-        "${CMAKE_CURRENT_BINARY_DIR}/bin/${EXAMPLE_APP_NAME}.app/Contents"
-        )    
-
-    # add missing keys to plist for Mac OS
-    if(APPLE)
+    # On macOS an example that captures audio must carry the microphone usage
+    # description in its Info.plist. The bundle path comes from a generator
+    # expression so it is right for multi-config generators (Xcode puts the app
+    # under bin/<config>/).
+    if(APPLE AND EXAMPLE_AUDIO_INPUT)
         set(ADD_PLIST_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/cmake/scripts/add-plist-value.sh")
-        set(RATIONALE "This app requires microphone access.")
         add_custom_command(
             TARGET ${EXAMPLE_APP_NAME} POST_BUILD
-            COMMAND ${ADD_PLIST_SCRIPT} NSMicrophoneUsageDescription "This app requires microphone access." "${PACKAGE_DIR}/Info.plist"
+            COMMAND ${ADD_PLIST_SCRIPT} NSMicrophoneUsageDescription "This app requires microphone access."
+                    "$<TARGET_BUNDLE_CONTENT_DIR:${EXAMPLE_APP_NAME}>/Info.plist"
             VERBATIM
         )
     endif()

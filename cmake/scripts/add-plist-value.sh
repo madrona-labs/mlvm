@@ -15,12 +15,13 @@ DICT_END="<\/dict>"
 LINE1="<key>"$KEY_STRING"</key>"
 LINE2="\t<string>"$VALUE_STRING"</string>"
 
-echo $KEY_STRING
-echo $VALUE_STRING
+if [ ! -f "$FILE_NAME" ]; then
+	echo "add-plist-value: $FILE_NAME not found" >&2
+	exit 1
+fi
 
 if
-! grep -q $KEY_STRING $FILE_NAME
+! grep -q "$KEY_STRING" "$FILE_NAME"
 then
-	echo 'fixing info.plist...'
-	perl -i -pe 's/'$DICT_END'/\t<key>'$KEY_STRING'<\/key>\n\t<string>'"$VALUE_STRING"'<\/string>\n'$DICT_END'/;'  $FILE_NAME
+	perl -i -pe 's/'$DICT_END'/\t<key>'$KEY_STRING'<\/key>\n\t<string>'"$VALUE_STRING"'<\/string>\n'$DICT_END'/;'  "$FILE_NAME"
 fi
