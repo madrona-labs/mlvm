@@ -236,6 +236,8 @@ using ControlRow = std::array<float, 16>;              // one row for all voices
 struct VoiceControls { ControlRow rows[kNumControlRows]; };   // one channel, 640 bytes
 ```
 
+The pitch row carries what the host put in the note-on's `value1`: a MIDI note number, with any bend already added in semitones. That is the convention the CLAP wrappers (Aalto, Manzanita) and `MIDIMessageToEvent` share, and madronalib's `Scale` owns the note-to-pitch mapping, so the row is not in octaves. A program converts before feeding a generator: `(n - 69) / 12` gives SAW's log pitch with 0 = A440.
+
 EventsToSignals fills a `VoiceControls` at the end of `makeSignalBlock()` alongside its a-rate outputs, derived from them. The a-rate path stays on during a transition period; later a flag can switch it off, which is where the CPU saving is realized, and the derivation becomes direct.
 
 ### Controllers

@@ -26,7 +26,7 @@ void processAudio(AudioContext* context, MLVM* vm)
   vm->processBlock(context);
 }
 
-int main(int, char*[])
+int main(int argc, char* argv[])
 {
   // start the Timers. call this once in an application.
   bool deferToMainThread = false;
@@ -36,16 +36,35 @@ int main(int, char*[])
   AudioContext ctx(kInputChannels, kOutputChannels);
   ctx.setInputPolyphony(kVoices);
 
-  // MIDI goes straight into the context's event channel 0.
+  // MIDI goes into the context's event channel 0: its first EventsToSignals, which
+  // the program reads as events0 and ctl0. The MIDI channel rides inside the Event
+  // and is ignored for note allocation in the default MIDI protocol, so MPE
+  // controllers play as plain polyphonic MIDI. The handler runs on the MIDI input's
+  // thread, so events are posted to the context's queue rather than added directly;
+  // process() moves them in on the audio thread before its next block.
   const auto& handleMIDI = [&](MIDIMessage m) -> void
   {
-    ctx.addInputEvent(MIDIMessageToEvent(m));
+    ctx.postInputEvent(MIDIMessageToEvent(m));
   };
+
+  // list the MIDI inputs and open one: port 0 by default, or the port number given
+  // as the first argument.
   MIDIInput midiInput;
-  if (!midiInput.start(handleMIDI)) {
-    std::cout << "couldn't start MIDI input!\n";
+  const unsigned int portCount = midiInput.getPortCount();
+  std::cout << portCount << " MIDI input port(s) via " << midiInput.getAPIDisplayName() << ":\n";
+  for (unsigned int i = 0; i < portCount; ++i) {
+    std::cout << "  " << i << ": " << midiInput.getPortName(i) << "\n";
+  }
+  if (portCount == 0) {
+    std::cout << "no MIDI input ports found!\n";
     return 1;
   }
+  const unsigned int port = (argc > 1) ? static_cast<unsigned int>(std::atoi(argv[1])) : 0;
+  if (!midiInput.start(handleMIDI, port)) {
+    std::cout << "couldn't start MIDI input on port " << port << "!\n";
+    return 1;
+  }
+  std::cout << "listening on port " << port << ": " << midiInput.getPortName(port) << "\n";
 
   // the synth, as an mlvm program. Registers r16.. hold 16-voice banks.
   const std::string program =
@@ -55,7 +74,11 @@ int main(int, char*[])
     ARENA  kstate 32
 
     LOAD_G.16   r16, events0/1, kstate/0        // gates
-    LOAD_KS.16  r32, r16, events0/0, kstate/1   // pitch, stepping at note onsets
+    LOAD_KS.16  r32, r16, events0/0, kstate/1   // note number, stepping at note onsets
+    LOAD_I.16   r96, -69.0f
+    ADD.16      r32, r32, r96                   // semitones from A440
+    LOAD_I.16   r96, 0.0833333f
+    MUL.16      r32, r32, r96                   // octaves: SAW's pitch unit, 0 = A440
     LOAD_KS.16  r48, r16, events0/2, kstate/2   // velocity
     LOAD_K.16   r64, ctl0/1, kstate/3           // mod wheel, broadcast to every voice
 
