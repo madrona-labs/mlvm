@@ -659,6 +659,36 @@ void testData() {
   }
 }
 
+void testLineContinuation() {
+  using namespace mlvm;
+  // a backslash joins lines, for DATA rows and for instructions alike; comments may
+  // follow the backslash
+  auto r = assemble(
+    "ARENA a 4\n"
+    "DATA a/1 \\   // four values on two lines\n"
+    "  1 2 \\\n"
+    "  3 4\n"
+    "ADD r1, \\\n"
+    "    r2, r3\n"
+    "HALT\n");
+  if (!r.ok()) printErrors(r);
+  CHECK(r.ok());
+  CHECK_EQ(r.program.data.size(), 1u);
+  CHECK_EQ(r.program.data[0].values.size(), 4u);
+  CHECK(r.program.data[0].values[3] == 4.f);
+  CHECK_EQ(r.program.instructions.size(), 2u);
+  CHECK((r.program.instructions[0] == Instruction{ADD, 1, 2, 0, 3, 0, 0, 0}));
+
+  // an error in a joined statement reports the statement's first line
+  auto bad = assemble("ARENA a 4\nADD r1, \\\n  r2\nHALT\n");
+  CHECK(!bad.ok());
+  CHECK(hasErrorOnLine(bad, 2));
+
+  // a continuation with nothing after it is an error
+  auto eof = assemble("HALT \\\n");
+  CHECK(!eof.ok());
+}
+
 void testSine() {
   using namespace mlvm;
   auto r = assemble(R"(
@@ -716,8 +746,12 @@ std::string example0Program() {
     "EXTERN audioout " + kFramesStr + "\n" + R"(
     ARENA  consts 16
     ARENA  kstate 16
-    DATA   consts/0 -2 -1.8333 -1.6667 -1.4167 -1.25 -1 -0.8333 -0.6667 -0.4167 -0.25 0 0.1667 0.3333 0.5833 0.75 1
-    DATA   consts/1 -11.103 -11.152 -11.203 -11.255 -11.310 -11.366 -11.425 -11.487 -11.550 -11.618 -11.689 -11.762 -11.840 -11.923 -12.010 -12.103
+    DATA   consts/0 \
+      -2 -1.8333 -1.6667 -1.4167 -1.25 -1 -0.8333 -0.6667 \
+      -0.4167 -0.25 0 0.1667 0.3333 0.5833 0.75 1
+    DATA   consts/1 \
+      -11.103 -11.152 -11.203 -11.255 -11.310 -11.366 -11.425 -11.487 \
+      -11.550 -11.618 -11.689 -11.762 -11.840 -11.923 -12.010 -12.103
     LOAD_K.16  r16, consts/0, kstate/0
     LOAD_K.16  r32, consts/1, kstate/1
     SINE.16    r48, r16, kstate/2
@@ -995,6 +1029,7 @@ int main() {
   testVerticalControl();
   testBroadcastAndMix();
   testData();
+  testLineContinuation();
   testSine();
   testExample0Chain();
   testSvfEncoding();

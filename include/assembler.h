@@ -18,8 +18,9 @@
 // else a label. Where an operand lands in the instruction word is decided by the
 // opcode's format, its row in the instruction table (see OpFormat and formatSpec
 // in mlvm.h), never by its position among other kinds. Operand count and kinds
-// are checked against the format. Comments start with // or ;. Mnemonics and
-// register names are case-insensitive.
+// are checked against the format. Comments start with // or ;. A line ending in a
+// backslash continues on the next line. Mnemonics and register names are
+// case-insensitive.
 
 #pragma once
 

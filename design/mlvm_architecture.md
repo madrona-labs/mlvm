@@ -305,7 +305,7 @@ Stateful operators already carry params arena and chunk fields, so an operator d
 - Named symbols for arenas and chunks (resolved to raw addresses at assemble time)  
 - Manifest section at top declaring buffers and arenas with chunk sizes  
 - `DATA name/chunk v0 v1 ...` fills a chunk of an owned arena with constants at load time: the program's data section. A 16-value row read with `LOAD_K.16` becomes a bank of per-voice constants.  
-- One instruction per line, mnemonic \+ operands. Bank size is a mnemonic suffix: `SVF.4` is bank size 4, `SVF` is 0.  
+- One instruction per line, mnemonic \+ operands. A line ending in a backslash continues on the next line. Bank size is a mnemonic suffix: `SVF.4` is bank size 4, `SVF` is 0.  
 - Operand kind is determined by its text: `rN` a register, `name/chunk` an arena reference, `42.333f` a float immediate, a bare integer an element number, anything else a label.  
 - **Operand formats.** Where an operand lands is decided by the opcode's row in the instruction table above. The opcode list in `mlvm.h` declares each opcode once with its row name (`X(SAW, kGen)`), and `formatSpec()` turns a row name into the fields its operands occupy. The assembler checks operand count and kinds against the row and places them accordingly, so the table is the single source of truth for encoding. The VM's switch reads the same fields; a test assembles one instruction per opcode and checks every field against the spec.  
 - Output: binary program file (manifest \+ instruction stream)

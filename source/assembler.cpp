@@ -147,13 +147,39 @@ public:
   AssemblyResult parse(std::string_view source) {
     line_ = 0;
     size_t pos = 0;
+    // a line ending in a backslash continues on the next line; the joined statement
+    // reports errors against its first line.
+    std::string statement;
+    int statementLine = 0;
+    bool open = false;   // the previous line ended in a backslash
     while (pos <= source.size()) {
       size_t nl = source.find('\n', pos);
       std::string_view rawLine = source.substr(pos, nl == std::string_view::npos ? std::string_view::npos : nl - pos);
       ++line_;
-      parseLine(trim(stripComment(rawLine)));
+      std::string_view text = trim(stripComment(rawLine));
+      if (!open) statementLine = line_;
+      const bool continues = !text.empty() && text.back() == '\\';
+      if (continues) text = trim(text.substr(0, text.size() - 1));
+      if (!text.empty()) {
+        if (!statement.empty()) statement += ' ';
+        statement += text;
+      }
+      if (continues) {
+        open = true;
+      } else if (!(open && text.empty())) {   // a blank line inside a continuation keeps it open
+        const int physicalLine = line_;
+        line_ = statementLine;
+        parseLine(statement);
+        line_ = physicalLine;
+        statement.clear();
+        open = false;
+      }
       if (nl == std::string_view::npos) break;
       pos = nl + 1;
+    }
+    if (open) {
+      line_ = statementLine;
+      error("line continuation at end of program");
     }
     resolveFixups();
     return std::move(result_);

@@ -19,7 +19,6 @@ using mlvm::MLVM;
 
 constexpr int kInputChannels = 0;
 constexpr int kOutputChannels = 2;
-constexpr int kSampleRate = 48000;
 constexpr int kVoices = 16;
 
 struct SynthState {
@@ -126,7 +125,7 @@ int main(int argc, char* argv[])
   SynthState state{&vm};
   AudioTask synthTask(&ctx, processAudio, &state);
   Logger log(&synthTask, &ctx, &vm);
-  ctx.updateTime(0, 120.0, true, kSampleRate);
+  ctx.updateTime(0, 120.0, true);
 
   return synthTask.runConsoleApp();
 }

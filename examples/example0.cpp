@@ -20,7 +20,6 @@ using mlvm::MLVM;
 
 constexpr int kInputChannels = 0;
 constexpr int kOutputChannels = 2;
-constexpr int kSampleRate = 48000;
 
 const std::string kProgram =
   "EXTERN audioout " + std::to_string(kFramesPerBlock) + "\n" + R"(
@@ -28,9 +27,14 @@ const std::string kProgram =
   ARENA  kstate 16
 
   // voice pitches: major pentatonic from 110 Hz (semitones 0 2 4 7 9, three octaves)
-  DATA   consts/0 -2 -1.8333 -1.6667 -1.4167 -1.25 -1 -0.8333 -0.6667 -0.4167 -0.25 0 0.1667 0.3333 0.5833 0.75 1
+  DATA   consts/0 \
+    -2 -1.8333 -1.6667 -1.4167 -1.25 -1 -0.8333 -0.6667 \
+    -0.4167 -0.25 0 0.1667 0.3333 0.5833 0.75 1
+
   // LFO pitches: 0.2 Hz down to 0.1 Hz, evenly spaced
-  DATA   consts/1 -11.103 -11.152 -11.203 -11.255 -11.310 -11.366 -11.425 -11.487 -11.550 -11.618 -11.689 -11.762 -11.840 -11.923 -12.010 -12.103
+  DATA   consts/1 \
+    -11.103 -11.152 -11.203 -11.255 -11.310 -11.366 -11.425 -11.487 \
+    -11.550 -11.618 -11.689 -11.762 -11.840 -11.923 -12.010 -12.103
 
   LOAD_K.16  r16, consts/0, kstate/0     // voice pitches -> bank r16..r31
   LOAD_K.16  r32, consts/1, kstate/1     // lfo pitches   -> bank r32..r47
@@ -49,13 +53,9 @@ const std::string kProgram =
   HALT
 )";
 
-struct ExampleState {
-  MLVM* vm{nullptr};
-};
-
-void processAudio(AudioContext* context, ExampleState* state)
+void processAudio(AudioContext* context, MLVM* vm)
 {
-  state->vm->processBlock(context);
+  vm->processBlock(context);
 }
 
 // Logs from a separate thread so nothing prints on the audio thread.
@@ -102,11 +102,10 @@ int main(int, char*[])
     return 1;
   }
 
-  ExampleState state{&vm};
   AudioContext ctx(kInputChannels, kOutputChannels);
-  AudioTask exampleTask(&ctx, processAudio, &state);
+  AudioTask exampleTask(&ctx, processAudio, &vm);
   Logger log(&exampleTask, &ctx, &vm);
-  ctx.updateTime(0, 120.0, true, kSampleRate);
+  ctx.updateTime(0, 120.0, true);
 
   return exampleTask.runConsoleApp();
 }
