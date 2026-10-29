@@ -620,6 +620,147 @@ int countWraps(const std::vector<float>& s) {
   return wraps;
 }
 
+void testData() {
+  using namespace mlvm;
+  auto r = assemble(R"(
+    ARENA  consts 4
+    EXTERN ctl0 1
+    DATA   consts/2 1.5f 2 -3.25
+    DATA   consts/0 7
+    HALT
+  )");
+  if (!r.ok()) printErrors(r);
+  CHECK(r.ok());
+  CHECK_EQ(r.program.data.size(), 2u);
+  CHECK(disassemble(r.program).find("DATA consts/2 1.5 2 -3.25") != std::string::npos);
+
+  MLVM vm;
+  CHECK(vm.loadProgram(r.program));
+  const float* consts = vm.arenas[0].data();
+  CHECK(consts[2 * 4 + 0] == 1.5f);
+  CHECK(consts[2 * 4 + 1] == 2.f);
+  CHECK(consts[2 * 4 + 2] == -3.25f);
+  CHECK(consts[2 * 4 + 3] == 0.f);     // unwritten rest of the chunk stays zero
+  CHECK(consts[0] == 7.f);
+
+  // errors: external arena, too many values, undeclared arena, no values
+  for (const char* bad : {"ARENA a 4\nEXTERN ctl0 1\nDATA ctl0/0 1.0\n",
+                          "ARENA a 4\nDATA a/0 1 2 3 4 5\n",
+                          "DATA nothere/0 1\n",
+                          "ARENA a 4\nDATA a/0\n"}) {
+    auto e = assemble(bad);
+    CHECK(!e.ok());
+  }
+}
+
+void testSine() {
+  using namespace mlvm;
+  auto r = assemble(R"(
+    ARENA kstate 32
+    SINE.4   r16, r32, kstate/0
+    UNBANK.4 r40, r16
+    SINE     r1, r2, kstate/1
+    HALT
+  )");
+  if (!r.ok()) printErrors(r);
+  CHECK(r.ok());
+  MLVM vm;
+  vm.sampleRate = 48000.0;
+  CHECK(vm.loadProgram(r.program));
+  const float lfoPitch = std::log2(0.25f / 440.f);   // 0.25 Hz: below the filters' floor
+  for (size_t i = 0; i < kFrames; ++i) {
+    bankFloat(vm, 32, 0, i) = 0.f;         // 440 Hz
+    bankFloat(vm, 32, 1, i) = lfoPitch;
+    bankFloat(vm, 32, 2, i) = 1.f;         // 880 Hz
+    bankFloat(vm, 32, 3, i) = 0.f;
+  }
+  vm.registers[2] = ml::SignalBlock(0.f);
+
+  // 4 seconds: 440 Hz gives 2 * 440 * 4 zero crossings; 0.25 Hz gives 2 (one full period).
+  const size_t seconds = 4;
+  std::vector<float> v0, v1, v2, h;
+  while (v0.size() < 48000 * seconds) {
+    vm.run();
+    for (size_t i = 0; i < kFrames; ++i) {
+      v0.push_back(vm.registers[40][i]);
+      v1.push_back(vm.registers[41][i]);
+      v2.push_back(vm.registers[42][i]);
+      h.push_back(vm.registers[1][i]);
+    }
+  }
+  auto crossings = [](const std::vector<float>& s) {
+    int c = 0;
+    for (size_t i = 1; i < s.size(); ++i) if ((s[i - 1] < 0.f) != (s[i] < 0.f)) ++c;
+    return c;
+  };
+  const int expected440 = static_cast<int>(2.f * 440.f * v0.size() / 48000.f);
+  CHECK(std::abs(crossings(v0) - expected440) <= 2);
+  CHECK(std::abs(crossings(v2) - 2 * expected440) <= 2);
+  CHECK(crossings(v1) == 2);                        // unclamped LFO rate
+  for (float s : v0) CHECK(s >= -1.001f && s <= 1.001f);
+  float peak = 0.f;
+  for (float s : v0) peak = std::max(peak, std::fabs(s));
+  CHECK(peak > 0.95f);
+  CHECK(h == v0);                                    // bank 0 matches lane 0
+}
+
+// Example0's program, built the same way the example builds it
+std::string example0Program() {
+  const std::array<float, 16> voiceHz = {110.00f, 123.47f, 138.59f, 164.81f, 185.00f, 220.00f, 246.94f, 277.18f,
+                                         329.63f, 369.99f, 440.00f, 493.88f, 554.37f, 659.26f, 739.99f, 880.00f};
+  std::string data0 = "DATA consts/0", data1 = "DATA consts/1";
+  for (size_t v = 0; v < 16; ++v) {
+    data0 += " " + std::to_string(std::log2(voiceHz[v] / 440.f));
+    data1 += " " + std::to_string(std::log2((0.2f - 0.1f * v / 15.f) / 440.f));
+  }
+  return
+    "EXTERN audioout " + kFramesStr + "\nARENA consts 16\nARENA kstate 16\n" + data0 + "\n" + data1 + "\n" + R"(
+    LOAD_K.16  r16, consts/0, kstate/0
+    LOAD_K.16  r32, consts/1, kstate/1
+    SINE.16    r48, r16, kstate/2
+    SINE.16    r64, r32, kstate/3
+    LOAD_I.16  r80, 1.0f
+    ADD.16     r64, r64, r80
+    LOAD_I.16  r80, 0.5f
+    MUL.16     r64, r64, r80
+    MUL.16     r48, r48, r64
+    MIX.16     r8, r48
+    LOAD_I     r9, 0.03f
+    MUL        r8, r8, r9
+    STORE      r8, audioout/0
+    STORE      r8, audioout/1
+    HALT
+  )";
+}
+
+void testExample0Chain() {
+  using namespace mlvm;
+  auto r = assemble(example0Program());
+  if (!r.ok()) printErrors(r);
+  CHECK(r.ok());
+  MLVM vm;
+  vm.sampleRate = 48000.0;
+  CHECK(vm.loadProgram(r.program));
+  std::vector<float> out(2 * kFrames, 0.f);
+  CHECK(vm.bindArena(0, out.data(), out.size(), true));
+
+  // the LFOs start at their trough (gain 0) and fade the voices in, so run 3 seconds
+  float peak = 0.f;
+  bool nonzero = false;
+  const int blocks = static_cast<int>(3 * 48000 / kFrames);
+  for (int b = 0; b < blocks; ++b) {
+    vm.run();
+    for (size_t i = 0; i < kFrames; ++i) {
+      CHECK(out[i] == out[kFrames + i]);
+      peak = std::max(peak, std::fabs(out[i]));
+      if (out[i] != 0.f) nonzero = true;
+    }
+  }
+  CHECK(nonzero);
+  CHECK(peak > 0.01f);
+  CHECK(peak < 0.5f);
+}
+
 void testSvfEncoding() {
   using namespace mlvm;
   auto r = assemble("ARENA kstate 32\nSVF.4 r0, r4, r8, r12, kstate/5\nONEPOLE r1, r2, r3, kstate/6\nSAW r1, r2, kstate/7\nHALT\n");
@@ -850,6 +991,9 @@ int main() {
   testElementwiseBank();
   testVerticalControl();
   testBroadcastAndMix();
+  testData();
+  testSine();
+  testExample0Chain();
   testSvfEncoding();
   testSaw();
   testSvf();

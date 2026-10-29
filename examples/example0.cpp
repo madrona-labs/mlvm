@@ -1,59 +1,118 @@
-// madronalib: a C++ framework for DSP applications.
-// Copyright (c) 2020-2022 Madrona Labs LLC. http://www.madronalabs.com
-// Distributed under the MIT license: http://madrona-labs.mit-license.org/
+// mlvm
+// Copyright (c) 2025 Madrona Labs LLC. http://www.madronalabs.com
 
-// example of RtAudio wrapping low-level madronalib DSP code.
+// Example0: an audible test that needs no MIDI. Sixteen sine voices on a pentatonic
+// scale from 110 Hz, each with its own slow sine LFO on its gain. The LFO rates run
+// from 0.2 Hz down to 0.1 Hz, so the voices drift in and out of phase and the chord
+// sweeps. The voices are summed and centered in a stereo output.
+//
+// The per-voice constants are tables in this file, in Hz for readability, converted
+// to mlvm's pitch unit (octaves, 0 = A440) and written into the program as DATA lines:
+// the program's data section. LOAD_K.16 turns a 16-float row into a vertical bank.
 
+#include <array>
+#include <cmath>
 #include <iostream>
-#include "madronalib.h"
+#include <sstream>
+#include <string>
 
-// TODO figure out better private interface setup
+#include "madronalib.h"
 #include "mlvm.h"
 #include "assembler.h"
 
 using mlvm::MLVM;
 
-// TEMP
 constexpr int kInputChannels = 0;
 constexpr int kOutputChannels = 2;
 constexpr int kSampleRate = 48000;
-constexpr float kOutputGain = 0.1f;
+constexpr size_t kVoices = 16;
 
-struct VMExampleState {
+// ---- the constant tables
+
+// voice pitches: major pentatonic from 110 Hz, semitones 0 2 4 7 9 and up three octaves
+constexpr std::array<float, kVoices> kVoiceHz = {
+  110.00f, 123.47f, 138.59f, 164.81f, 185.00f,
+  220.00f, 246.94f, 277.18f, 329.63f, 369.99f,
+  440.00f, 493.88f, 554.37f, 659.26f, 739.99f,
+  880.00f
+};
+
+// LFO rates: evenly spaced from 0.2 Hz down to 0.1 Hz, one per voice
+constexpr std::array<float, kVoices> kLfoHz = {
+  0.2000f, 0.1933f, 0.1867f, 0.1800f, 0.1733f,
+  0.1667f, 0.1600f, 0.1533f, 0.1467f, 0.1400f,
+  0.1333f, 0.1267f, 0.1200f, 0.1133f, 0.1067f,
+  0.1000f
+};
+
+// mlvm pitch is log2(frequency / 440)
+float pitchFromHz(float hz) { return std::log2(hz / 440.f); }
+
+// a DATA line: "DATA name/chunk v0 v1 ..." with the table converted to pitch
+std::string pitchDataLine(const std::string& arena, int chunk, const std::array<float, kVoices>& hzTable)
+{
+  std::ostringstream line;
+  line << "DATA " << arena << "/" << chunk;
+  for (float hz : hzTable) line << " " << pitchFromHz(hz);
+  return line.str();
+}
+
+// ---- the program
+
+std::string makeProgram()
+{
+  return
+    "EXTERN audioout " + std::to_string(kFramesPerBlock) + "\n"
+    "ARENA  consts 16\n"
+    "ARENA  kstate 16\n" +
+    pitchDataLine("consts", 0, kVoiceHz) + "\n" +
+    pitchDataLine("consts", 1, kLfoHz) + "\n" + R"(
+    LOAD_K.16  r16, consts/0, kstate/0     // voice pitches -> bank r16..r31
+    LOAD_K.16  r32, consts/1, kstate/1     // lfo pitches   -> bank r32..r47
+    SINE.16    r48, r16, kstate/2          // oscillators
+    SINE.16    r64, r32, kstate/3          // lfos, -1..1
+    LOAD_I.16  r80, 1.0f
+    ADD.16     r64, r64, r80               // 0..2
+    LOAD_I.16  r80, 0.5f
+    MUL.16     r64, r64, r80               // gain 0..1
+    MUL.16     r48, r48, r64               // voice = osc * gain
+    MIX.16     r8, r48                     // sum the voices
+    LOAD_I     r9, 0.03f                   // about 0.5 / 16
+    MUL        r8, r8, r9
+    STORE      r8, audioout/0              // centered stereo
+    STORE      r8, audioout/1
+    HALT
+  )";
+}
+
+// ---- host plumbing
+
+struct ExampleState {
   MLVM* vm{nullptr};
 };
 
-// processAudio() does all of the audio processing, in SignalBlock-sized chunks.
-// It is called every time a new buffer of audio is needed.
-void processAudio(AudioContext* context, VMExampleState* state)
+void processAudio(AudioContext* context, ExampleState* state)
 {
   state->vm->processBlock(context);
 }
 
-struct ContextLogger
+// Logs from a separate thread so nothing prints on the audio thread.
+struct Logger
 {
-  ContextLogger(AudioTask* t, AudioContext* c, MLVM* v)
+  Logger(AudioTask* t, AudioContext* c, MLVM* v) : task(t), context(c), vm(v)
   {
-    task = t;
-    context = c;
-    vm = v;
-    logThread = std::thread ([&]() {
+    logThread = std::thread([&]() {
       while (!task->hasQuit())
       {
-        auto timeInfo = context->getTimeInfo();
-        std::cout << "bpm:" << timeInfo.bpm << "\n";
-        std::cout << "phase:" << timeInfo.quarterNotesPhase_[0] << "\n";
-        std::cout << "samples since start:" << timeInfo.samplesSinceStart << "\n";
-        std::cout << "output 0-0:" << context->outputs[0][0] << "\n";
-        // r1 is voice 0's gate; r8 is the mix of all voices' pitch * mod wheel * gate.
-        std::cout << "voice 0 gate (r1):" << vm->registers[1][0]
-                  << " mix (r8):" << vm->registers[8][kFramesPerBlock - 1] << "\n";
+        float peak = 0.f;
+        for (size_t i = 0; i < kFramesPerBlock; ++i) peak = std::max(peak, std::fabs(context->outputs[0][i]));
+        // r64 is the gain bank; its first float is voice 0's gain at frame 0.
+        std::cout << "output peak: " << peak << "  voice 0 gain: " << vm->registers[64][0] << "\n";
         std::this_thread::sleep_for(std::chrono::milliseconds(1000));
       }
     });
   }
-
-  ~ContextLogger() { logThread.join(); }
+  ~Logger() { logThread.join(); }
 
   AudioTask* task;
   AudioContext* context;
@@ -61,88 +120,31 @@ struct ContextLogger
   std::thread logThread;
 };
 
-int main( int argc, char *argv[] )
+int main(int, char*[])
 {
-  EventsToSignals eventsToSignals;
-  eventsToSignals.setSampleRate(kSampleRate);
-
-  const auto& handleMsg = [&](MIDIMessage m)->void
-  {
-    std::cout << "handleMsg got " << m.size() << "bytes: ";
-    for ( int i=0; i<m.size(); i++ )
-      std::cout << (int)m[i] << " ";
-    std::cout << "\n";
-    eventsToSignals.addEvent(MIDIMessageToEvent(m));
-  };
-
-  MIDIInput midiInput;
-  if (!midiInput.start(handleMsg)) {
-    std::cout << "couldn't start MIDI input!\n";
-  }
-
   // start the Timers. call this once in an application.
   bool deferToMainThread = false;
   SharedResourcePointer<ml::Timers> t;
   t->start(deferToMainThread);
 
-  // setup the vm
-  MLVM vm;
-
-  // TODO compile a graph of modules, getting memory needs
-  // auto testGraph = readJSONGraph;
-  // vm.compile(testGraph, testProgram);
-
-  // but right now we can use the assembler to write a
-  // program that is like a single module.
-  // Outputs are read from registers starting at kOutputRegisterBase.
-  // The host provides its data as external arenas, bound by name every block; the
-  // program reads only what it declares. events0 holds channel 0's voice rows (see
-  // ml::ControlSignals: chunk 0 pitch, chunk 1 gate), ctl0 its 128 controller values.
-  // LOAD_G expands voice 0's gate to r1; LOAD_KS steps voice 0's pitch into r2 at the
-  // gate's rise; LOAD_K ramps the mod wheel into r3. Oscillators are still stubs, so
-  // the outputs just pass the (absent) audio input through: silence.
-  const std::string testCode =
-    "EXTERN audioin " + std::to_string(kFramesPerBlock) + "\n"
-    "EXTERN audioout " + std::to_string(kFramesPerBlock) + "\n" + R"(
-    EXTERN events0 16
-    EXTERN ctl0 1
-    ARENA  kstate 32
-
-    // a 16-voice bank: gates, pitches stepping at onsets, mod wheel broadcast to all voices
-    LOAD_G.16   r16, events0/1, kstate/0         // gates   -> r16..r31 (vertical)
-    LOAD_KS.16  r32, r16, events0/0, kstate/1    // pitches -> r32..r47
-    LOAD_K.16   r48, ctl0/1, kstate/2            // mod wheel in every lane -> r48..r63
-    MUL.16      r64, r32, r48                    // pitch * mod, per voice (stands in for a synth voice)
-    MUL.16      r64, r64, r16                    // gated
-    MIX.16      r8, r64                          // sum the voices
-    UNBANK.4    r1, r16                          // voice 0's gate, horizontal, for the logger
-    LOAD        r4, audioin/0
-    STORE       r4, audioout/0
-    STORE       r4, audioout/1
-    HALT
-  )";
-
-  mlvm::AssemblyResult assembled = mlvm::assemble(testCode);
+  mlvm::AssemblyResult assembled = mlvm::assemble(makeProgram());
   if (!assembled.ok()) {
-    for (const auto& e : assembled.errors) {
-      std::cout << "line " << e.line << ": " << e.message << "\n";
-    }
+    for (const auto& e : assembled.errors) std::cout << "line " << e.line << ": " << e.message << "\n";
     return 1;
   }
   std::cout << mlvm::disassemble(assembled.program);
 
-  if (!vm.loadProgram(assembled.program)) return 1;
+  MLVM vm;
+  if (!vm.loadProgram(assembled.program)) {
+    std::cout << "couldn't load program\n";
+    return 1;
+  }
 
-  // fill a struct with the data the callback will need to create a context.
-  VMExampleState state{&vm};
-  
+  ExampleState state{&vm};
   AudioContext ctx(kInputChannels, kOutputChannels);
   AudioTask exampleTask(&ctx, processAudio, &state);
-  ContextLogger log(&exampleTask, &ctx, &vm);
-  
-  // roll onward at 120 bpm
+  Logger log(&exampleTask, &ctx, &vm);
   ctx.updateTime(0, 120.0, true, kSampleRate);
 
-  // run the audio task
   return exampleTask.runConsoleApp();
 }

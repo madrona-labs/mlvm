@@ -207,8 +207,18 @@ struct ArenaDescription {
   bool external{false};
 };
 
+// A constant table: values written into a chunk of an owned arena when the program
+// is loaded. The program's data section; what a compiler emits for per-voice
+// constants, wavetables and the like.
+struct DataInit {
+  uint8_t arena;
+  uint8_t chunk;
+  std::vector< float > values;
+};
+
 struct Program {
   std::vector< ArenaDescription > manifest;
+  std::vector< DataInit > data;
   std::vector< Instruction > instructions;
 };
 
@@ -320,6 +330,7 @@ struct MLVM {
   // k of voice v is at chunk[k * N + v] for a bank of N (N = 1 for bank 0), so a
   // group's four lanes are contiguous.
   //   SAW.N     dest, pitch, state/chunk             polyBLEP sawtooth. state: phase (N floats)
+  //   SINE.N    dest, pitch, state/chunk             sine. state: phase (N floats)
   //   SVF.N     dest, in, cutoffPitch, k, state/chunk lowpass SVF, k = 1/Q, all audio rate.
   //                                                  state: ic1eq[N] ic2eq[N] (2N floats)
   //   ONEPOLE.N dest, in, time, state/chunk          one-pole lowpass, time in seconds read

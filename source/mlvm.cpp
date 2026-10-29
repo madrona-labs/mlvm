@@ -127,6 +127,18 @@ inline float4 pitchToOmega4(float4 pitch, float scale) {
   return clamp(expApprox(kLogTwoVec * pitch) * float4(scale), float4(kOmegaMin), float4(kOmegaMax));
 }
 
+// the same for generators, whose floor is 0: an LFO at 0.1 Hz is a valid oscillator
+// but far below the filters' minimum.
+inline float4 pitchToOmegaGen4(float4 pitch, float scale) {
+  return clamp(expApprox(kLogTwoVec * pitch) * float4(scale), float4(0.f), float4(kOmegaMax));
+}
+
+enum class Wave { saw, sine };
+
+inline float4 shapeWave(Wave w, float4 phase, float4 omega) {
+  return (w == Wave::saw) ? phasorToSawSample(phase, omega) : phasorToSineSample(phase);
+}
+
 // one-pole coefficient for a time constant in seconds; time <= 0 means instant.
 inline float onePoleCoeff(float timeInSeconds, double sampleRate) {
   if (timeInSeconds <= 0.f) return 1.f;
@@ -162,6 +174,13 @@ bool MLVM::loadProgram(const Program& newProgram) {
     newExternals.push_back({static_cast<uint8_t>(i), kind, channel});
   }
 
+  // constant tables must target owned arenas and fit their chunks.
+  for (const auto& d : newProgram.data) {
+    if (d.arena >= newProgram.manifest.size()) return false;
+    const auto& desc = newProgram.manifest[d.arena];
+    if (desc.external || d.values.size() > desc.chunkSizeInFloats) return false;
+  }
+
   for (auto& a : arenas) a.clear();
   for (size_t i = 0; i < newProgram.manifest.size(); ++i) {
     const auto& desc = newProgram.manifest[i];
@@ -170,6 +189,10 @@ bool MLVM::loadProgram(const Program& newProgram) {
     } else {
       arenas[i].allocate(desc.chunkSizeInFloats, kChunksPerArena);
     }
+  }
+  for (const auto& d : newProgram.data) {
+    FloatArena& a = arenas[d.arena];
+    std::copy(d.values.begin(), d.values.end(), a.data() + d.chunk * a.chunkSizeInFloats);
   }
 
   program = newProgram;
@@ -477,8 +500,10 @@ void MLVM::run() {
       // ---- generators and filters
       // Per-voice state is variable-major in the chunk: variable k of voice v at
       // chunk[k * n + v]. The sample rate comes from processBlock() or the test.
-      case SAW: {
-        // polyBLEP sawtooth at the pitch in src1. state: phase per voice.
+      case SAW:
+      case SINE: {
+        // oscillator at the pitch in src1: polyBLEP sawtooth or sine. state: phase per voice.
+        const Wave wave = (opcode == SAW) ? Wave::saw : Wave::sine;
         float* phase = getArenaPtr(b6, b7, 0, n);
         if (!phase || !inRange(b1, n) || !inRange(b2, n)) break;
         const float scale = 440.f / static_cast<float>(sampleRate);
@@ -487,9 +512,9 @@ void MLVM::run() {
           SignalBlock out;
           float4 ph4(phase[0]);
           for (size_t i = 0; i < kFrames; ++i) {
-            const float4 om = pitchToOmega4(float4(pitch[i]), scale);
+            const float4 om = pitchToOmegaGen4(float4(pitch[i]), scale);
             ph4 = fracPart(ph4 + om);
-            out[i] = lane0(phasorToSawSample(ph4, om));
+            out[i] = lane0(shapeWave(wave, ph4, om));
           }
           phase[0] = lane0(ph4);
           registers[b1] = out;
@@ -500,9 +525,9 @@ void MLVM::run() {
           float* out = regPtr(b1) + g * kLanes * kFrames;
           float4 ph4 = gather4(phase + g * kLanes);
           for (size_t i = 0; i < kFrames; ++i) {
-            const float4 om = pitchToOmega4(loadFloat4(in + i * kLanes), scale);
+            const float4 om = pitchToOmegaGen4(loadFloat4(in + i * kLanes), scale);
             ph4 = fracPart(ph4 + om);
-            storeFloat4(out + i * kLanes, phasorToSawSample(ph4, om));
+            storeFloat4(out + i * kLanes, shapeWave(wave, ph4, om));
           }
           scatter4(phase + g * kLanes, ph4);
         }

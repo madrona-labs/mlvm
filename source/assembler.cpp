@@ -194,9 +194,54 @@ private:
       parseArena(tokens, false);
     } else if (head == "EXTERN") {
       parseArena(tokens, true);
+    } else if (head == "DATA") {
+      parseData(tokens);
     } else {
       parseInstruction(tokens);
     }
+  }
+
+  // DATA name/chunk v0 v1 ...   constants written into a chunk of an owned arena at load
+  void parseData(const std::vector<std::string_view>& tokens) {
+    if (tokens.size() < 3) {
+      error("DATA takes an arena/chunk and at least one value");
+      return;
+    }
+    auto target = parseOperand(tokens[1]);
+    if (!target) return;
+    auto* ref = std::get_if<ArenaRef>(&*target);
+    if (!ref) {
+      error("DATA's first operand must be an arena reference (name/chunk)");
+      return;
+    }
+    if (ref->arena >= result_.program.manifest.size()) {
+      error("DATA refers to arena " + std::to_string(ref->arena) + " which is not declared");
+      return;
+    }
+    const ArenaDescription& desc = result_.program.manifest[ref->arena];
+    if (desc.external) {
+      error("DATA cannot initialize an external arena ('" + desc.name + "')");
+      return;
+    }
+    DataInit init{ref->arena, ref->chunk, {}};
+    for (size_t i = 2; i < tokens.size(); ++i) {
+      float f = 0.f;
+      unsigned u = 0;
+      if (parseFloatLiteral(tokens[i], f)) {
+        init.values.push_back(f);
+      } else if (parseUInt(tokens[i], u)) {
+        init.values.push_back(static_cast<float>(u));
+      } else {
+        error("bad DATA value '" + std::string(tokens[i]) + "'");
+        return;
+      }
+    }
+    if (init.values.size() > desc.chunkSizeInFloats) {
+      error("DATA has " + std::to_string(init.values.size()) + " values but a chunk of '" + desc.name +
+            "' holds " + std::to_string(desc.chunkSizeInFloats));
+      return;
+    }
+    result_.program.data.push_back(std::move(init));
   }
 
   // ARENA name chunkSizeInFloats    allocated by the VM
@@ -420,6 +465,12 @@ std::string disassemble(const Program& program) {
   for (size_t i = 0; i < program.manifest.size(); ++i) {
     const auto& a = program.manifest[i];
     out << (a.external ? "EXTERN " : "ARENA ") << a.name << " " << a.chunkSizeInFloats << "   // arena " << i << "\n";
+  }
+  for (const auto& d : program.data) {
+    const std::string name = d.arena < program.manifest.size() ? program.manifest[d.arena].name : std::to_string(d.arena);
+    out << "DATA " << name << "/" << static_cast<unsigned>(d.chunk);
+    for (float v : d.values) out << " " << v;
+    out << "\n";
   }
   for (size_t i = 0; i < program.instructions.size(); ++i) {
     const Instruction& inst = program.instructions[i];
