@@ -370,8 +370,9 @@ void MLVM::run() {
       // TODO: semantics TBD (ALL / ANY / threshold, flag count). For now CMP sets
       // the flag if ANY frame of the first register is greater than the second.
       case CMP: {
-        const SignalBlock& x = registers[b1];
-        const SignalBlock& y = registers[b2];
+        // src1 in field 2, src2 in field 4, as the table says: CMP has no dest.
+        const SignalBlock& x = registers[b2];
+        const SignalBlock& y = registers[b4];
         bool any = false;
         for (size_t i = 0; i < kFrames; ++i) any |= (x[i] > y[i]);
         flag = any;

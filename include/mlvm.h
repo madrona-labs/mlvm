@@ -22,38 +22,50 @@ namespace mlvm {
 // ----------------------------------------------------------------
 // Opcodes
 //
-// The single source of truth for opcodes. Each X(name, flags) line yields the enum
-// constant, the assembler mnemonic and the opcode's flags. To add an opcode, add
-// one line here.
+// The single source of truth for opcodes. Each X(name, format) line yields the
+// enum constant, the assembler mnemonic and the opcode's operand format. To add
+// an opcode, add one line here.
 //
-// Flags: kOpState marks an operator that keeps state in a chunk addressed by
-// fields 6,7. The assembler uses it to place the last arena reference of such an
-// instruction in those fields, whatever else the instruction carries. Everything
-// else about operand placement is positional (see assembler.h).
+// The format names the opcode's row in the instruction table of the architecture
+// doc. formatSpec() below says which field each operand of that row occupies. The
+// assembler places operands from it, and the VM's switch reads the same fields;
+// the format tests assemble one instruction per opcode to keep the two honest.
 
-enum OpFlags : uint8_t {
-  kOpNone = 0,
-  kOpState = 1,
+enum class OpFormat : uint8_t {
+  kNoOperands,      // (none)                               NOOP, HALT
+  kDestSrc,         // dest, src1                           MOVE, NEG, SIN, SPREAD, MIX, BANK, UNBANK
+  kDestSrcSrc,      // dest, src1, src2                     ADD, MUL ...
+  kDestSrc3,        // dest, src1, src2, src3               LERP, CLAMP, SELECT
+  kGen,             // dest, src1 (pitch), state            SAW, SINE, IMPULSE, NOISE
+  kFilter2,         // dest, src1, src2, state              ONEPOLE
+  kFilter3,         // dest, src1, src2, src3, state        SVF, FOUR_POLE
+  kParamsState,     // dest, params, state                  LOAD_K, LOAD_G
+  kSrcParamsState,  // dest, src1, params, state            LOAD_KS
+  kImmediate,       // dest, float immediate                LOAD_I
+  kArenaAccess,     // register (field 1), arena (4,5)      LOAD, STORE
+  kElement,         // dest, src1, element number           FILL
+  kCompare,         // src1 (field 2), src2 (field 4)       CMP
+  kBranch,          // label -> pc offset (6,7)             BNE, JMP
 };
 
 #define MLVM_OPCODES(X) \
-  /* system */            X(NOOP, kOpNone) X(HALT, kOpNone) \
-  /* memory access */     X(MOVE, kOpNone) X(LOAD_I, kOpNone) X(LOAD, kOpNone) X(STORE, kOpNone) \
-  /* control rate */      X(LOAD_K, kOpState) X(LOAD_KS, kOpState) X(LOAD_G, kOpState) \
-  /* compare and branch */X(CMP, kOpNone) X(BNE, kOpNone) X(JMP, kOpNone) \
-  /* one-input math */    X(SIN, kOpNone) X(LOG, kOpNone) X(EXP, kOpNone) X(NEG, kOpNone) X(ABS, kOpNone) X(RCP, kOpNone) \
-  /* two-input math */    X(ADD, kOpNone) X(ADD_WRAP, kOpNone) X(SUB, kOpNone) X(SUB_WRAP, kOpNone) X(MUL, kOpNone) X(DIV, kOpNone) \
-  /* three-input math */  X(LERP, kOpNone) X(CLAMP, kOpNone) X(SELECT, kOpNone) \
-  /* generators */        X(SINE, kOpState) X(IMPULSE, kOpState) X(SAW, kOpState) X(NOISE, kOpState) \
-  /* filters */           X(SVF, kOpState) X(ONEPOLE, kOpState) X(FOUR_POLE, kOpState) \
-  /* layout */            X(FILL, kOpNone) X(SPREAD, kOpNone) X(MIX, kOpNone) X(BANK, kOpNone) X(UNBANK, kOpNone) \
-  /* misc */              X(SHIFT, kOpState) X(INTERP, kOpNone)
+  /* system */            X(NOOP, kNoOperands) X(HALT, kNoOperands) \
+  /* memory access */     X(MOVE, kDestSrc) X(LOAD_I, kImmediate) X(LOAD, kArenaAccess) X(STORE, kArenaAccess) \
+  /* control rate */      X(LOAD_K, kParamsState) X(LOAD_KS, kSrcParamsState) X(LOAD_G, kParamsState) \
+  /* compare and branch */X(CMP, kCompare) X(BNE, kBranch) X(JMP, kBranch) \
+  /* one-input math */    X(SIN, kDestSrc) X(LOG, kDestSrc) X(EXP, kDestSrc) X(NEG, kDestSrc) X(ABS, kDestSrc) X(RCP, kDestSrc) \
+  /* two-input math */    X(ADD, kDestSrcSrc) X(ADD_WRAP, kDestSrcSrc) X(SUB, kDestSrcSrc) X(SUB_WRAP, kDestSrcSrc) X(MUL, kDestSrcSrc) X(DIV, kDestSrcSrc) \
+  /* three-input math */  X(LERP, kDestSrc3) X(CLAMP, kDestSrc3) X(SELECT, kDestSrc3) \
+  /* generators */        X(SINE, kGen) X(IMPULSE, kGen) X(SAW, kGen) X(NOISE, kGen) \
+  /* filters */           X(SVF, kFilter3) X(ONEPOLE, kFilter2) X(FOUR_POLE, kFilter3) \
+  /* layout */            X(FILL, kElement) X(SPREAD, kDestSrc) X(MIX, kDestSrc) X(BANK, kDestSrc) X(UNBANK, kDestSrc) \
+  /* misc */              X(SHIFT, kGen) X(INTERP, kDestSrcSrc)
   // ... and many more
   // many opcodes will be much bigger chunks of stateful work like oscillators, table lookups,
   // env followers, and in general DSP machinery.
 
 enum Opcode : uint8_t {
-#define X(name, flags) name,
+#define X(name, format) name,
   MLVM_OPCODES(X)
 #undef X
   NUM_OPCODES
@@ -63,26 +75,67 @@ enum Opcode : uint8_t {
 static_assert(NUM_OPCODES < (1 << 8));
 
 inline constexpr std::string_view kOpcodeNames[] = {
-#define X(name, flags) #name,
+#define X(name, format) #name,
   MLVM_OPCODES(X)
 #undef X
 };
 
-inline constexpr uint8_t kOpcodeFlags[] = {
-#define X(name, flags) flags,
+inline constexpr OpFormat kOpcodeFormats[] = {
+#define X(name, format) OpFormat::format,
   MLVM_OPCODES(X)
 #undef X
 };
 
 static_assert(sizeof(kOpcodeNames) / sizeof(kOpcodeNames[0]) == NUM_OPCODES);
-static_assert(sizeof(kOpcodeFlags) / sizeof(kOpcodeFlags[0]) == NUM_OPCODES);
+static_assert(sizeof(kOpcodeFormats) / sizeof(kOpcodeFormats[0]) == NUM_OPCODES);
 
 constexpr std::string_view opcodeName(Opcode op) {
   return op < NUM_OPCODES ? kOpcodeNames[op] : std::string_view("?");
 }
 
-constexpr bool opcodeHasState(Opcode op) {
-  return op < NUM_OPCODES && (kOpcodeFlags[op] & kOpState);
+constexpr OpFormat opcodeFormat(Opcode op) {
+  return op < NUM_OPCODES ? kOpcodeFormats[op] : OpFormat::kNoOperands;
+}
+
+// ----------------------------------------------------------------
+// Operand placement per format: the instruction table as data.
+//
+// An operand slot names the kind of operand and the first field it occupies: a
+// register or element number takes one field, an arena reference two (arena,
+// chunk), a float immediate fields 4-7, a label fields 6-7 as a pc offset.
+
+enum class OperandKind : uint8_t { kReg, kArena, kFloat, kByte, kLabel };
+
+struct OperandSlot {
+  OperandKind kind;
+  uint8_t field;
+};
+
+struct FormatSpec {
+  OperandSlot slots[5];
+  uint8_t count;
+  bool hasBank;   // field 3 is a bank size for this row
+};
+
+constexpr FormatSpec formatSpec(OpFormat f) {
+  using K = OperandKind;
+  switch (f) {
+    case OpFormat::kNoOperands:     return {{}, 0, false};
+    case OpFormat::kDestSrc:        return {{{K::kReg, 1}, {K::kReg, 2}}, 2, true};
+    case OpFormat::kDestSrcSrc:     return {{{K::kReg, 1}, {K::kReg, 2}, {K::kReg, 4}}, 3, true};
+    case OpFormat::kDestSrc3:       return {{{K::kReg, 1}, {K::kReg, 2}, {K::kReg, 4}, {K::kReg, 5}}, 4, true};
+    case OpFormat::kGen:            return {{{K::kReg, 1}, {K::kReg, 2}, {K::kArena, 6}}, 3, true};
+    case OpFormat::kFilter2:        return {{{K::kReg, 1}, {K::kReg, 2}, {K::kReg, 4}, {K::kArena, 6}}, 4, true};
+    case OpFormat::kFilter3:        return {{{K::kReg, 1}, {K::kReg, 2}, {K::kReg, 4}, {K::kReg, 5}, {K::kArena, 6}}, 5, true};
+    case OpFormat::kParamsState:    return {{{K::kReg, 1}, {K::kArena, 4}, {K::kArena, 6}}, 3, true};
+    case OpFormat::kSrcParamsState: return {{{K::kReg, 1}, {K::kReg, 2}, {K::kArena, 4}, {K::kArena, 6}}, 4, true};
+    case OpFormat::kImmediate:      return {{{K::kReg, 1}, {K::kFloat, 4}}, 2, true};
+    case OpFormat::kArenaAccess:    return {{{K::kReg, 1}, {K::kArena, 4}}, 2, false};
+    case OpFormat::kElement:        return {{{K::kReg, 1}, {K::kReg, 2}, {K::kByte, 5}}, 3, true};
+    case OpFormat::kCompare:        return {{{K::kReg, 2}, {K::kReg, 4}}, 2, false};
+    case OpFormat::kBranch:         return {{{K::kLabel, 6}}, 1, false};
+  }
+  return {{}, 0, false};
 }
 
 // linear scan: this is only used at assemble time, never on the audio thread.

@@ -108,7 +108,7 @@ Chunk of the arena for ops with arena-stored states, or low bits of 16-bit jump 
 | **Filters** (SVF, ONEPOLE, FOUR\_POLE...) | op | dest | src1 (in) | bank size | src2 | src3 | state arena | state chunk |
 | **Filters/Gens with per-block params** (ADSR, DELAY (*1)...) | op | dest | src1 | bank size | params arena | params chunk | state arena | state chunk |
 | **Projections** (PROJ) (*2) | op | dest | src1 | bank size | params arena | params chunk | proj. type | `[unused]` |
-| **Memory access** (LOAD\_I, MOV...) (*3) | op | dest | src1 | `[unused]` | immed. 24:31 | immed. 16:23 | immed. 8:15 | immed. 0:7 |
+| **Memory access** (LOAD\_I, MOV...) (*3) | op | dest | src1 | bank size | immed. 24:31 | immed. 16:23 | immed. 8:15 | immed. 0:7 |
 | **Arena access** (LOAD, STORE, ...) (*3) | op | dest | src1 | `[unused]` | src1 arena | src1 chunk | dest arena | dest chunk |
 | **Layout** (FILL, SPREAD, MIX, BANK, UNBANK...) (*4) | op | dest | src1 | bank size | src2 | element\# | `[unused]` | `[unused]` |
 | **Compare and branch** (CMP, JMP...) (*5) | op | `[unused]` | src1 | `[unused]` | src2 | `[unused]` | pc offset 8:15 | pc offset 0:7 |
@@ -117,7 +117,7 @@ Chunk of the arena for ops with arena-stored states, or low bits of 16-bit jump 
 
 **(*1) Delays** — Delay state objects include internal state (playhead position, internal filters, etc.) as well as the buffer memory itself.
 
-**Pitch and parameters** — Pitch-like inputs (SAW's pitch, SVF's cutoff) are log pitch in octaves with 0 \= A440, madronalib's convention. The operators convert to omega internally, so cutoff modulation is octave arithmetic: `cutoff = pitch + mod × 4`. Filters take all their parameters at audio rate from register banks (`SVF.16 dest, in, cutoffPitch, k, state`), so anything can modulate anything; a constant is one `LOAD_I.16`. ONEPOLE's time in seconds is read at frame 0 of each block. Two assembler rules make this fit the fields. The opcode list carries one flag per opcode, "keeps state"; for such an opcode the last arena reference is its state and always goes to fields 6,7, so `SAW r1, r2, kstate/0` and `SVF.16 d, in, cutoff, k, kstate/5` both put the state where the VM reads it. Any other arena reference takes the first free pair. This flag is the first per-opcode column in the opcode list; it was added when SAW, with one arena reference, showed that no purely positional rule can serve both LOAD (data in 4,5) and a stateful op (state in 6,7).
+**Pitch and parameters** — Pitch-like inputs (SAW's pitch, SVF's cutoff) are log pitch in octaves with 0 \= A440, madronalib's convention. The operators convert to omega internally, so cutoff modulation is octave arithmetic: `cutoff = pitch + mod × 4`. Filters take all their parameters at audio rate from register banks (`SVF.16 dest, in, cutoffPitch, k, state`), so anything can modulate anything; a constant is one `LOAD_I.16`. ONEPOLE's time in seconds is read at frame 0 of each block. The assembler places these operands from the table: each opcode's line in the opcode list names its row (its *format*), and a per-row spec says which field every operand occupies. `SAW r1, r2, kstate/0` puts its state in 6,7 and `LOAD r1, a/3` its source in 4,5 because their rows say so, not because of where the reference appears in the text. See "Operand formats" under the assembler design.
 
 **State chunks** — Per-voice state is laid out variable-major in the chunk: variable k of voice v at `chunk[k × N + v]` for a bank of N, so a group's four lanes are one float4. SAW keeps one float per voice (phase), SVF two (the integrator states), ONEPOLE one. `ARENA kstate 32` holds any of these for 16 voices. The VM takes the sample rate from the AudioContext each block.
 
@@ -302,8 +302,8 @@ Stateful operators already carry params arena and chunk fields, so an operator d
 - Named symbols for arenas and chunks (resolved to raw addresses at assemble time)  
 - Manifest section at top declaring buffers and arenas with chunk sizes  
 - One instruction per line, mnemonic \+ operands. Bank size is a mnemonic suffix: `SVF.4` is bank size 4, `SVF` is 0.  
-- Operand kind is determined by its text, and kind determines its field: registers `rN` fill fields 1, 2, 4, 5 in order; arena refs `name/chunk` fill 4,5 then 6,7; a float immediate (`42.333f`) fills 4–7; a label fills 6,7 as a pc offset.  
-- Opcodes are declared once, in an X-macro list in `mlvm.h`, which generates the enum, the mnemonic table and a flags table. The one flag so far, "keeps state", tells the assembler that the instruction's last arena reference is its state chunk, fields 6,7.  
+- Operand kind is determined by its text: `rN` a register, `name/chunk` an arena reference, `42.333f` a float immediate, a bare integer an element number, anything else a label.  
+- **Operand formats.** Where an operand lands is decided by the opcode's row in the instruction table above. The opcode list in `mlvm.h` declares each opcode once with its row name (`X(SAW, kGen)`), and `formatSpec()` turns a row name into the fields its operands occupy. The assembler checks operand count and kinds against the row and places them accordingly, so the table is the single source of truth for encoding. The VM's switch reads the same fields; a test assembles one instruction per opcode and checks every field against the spec.  
 - Output: binary program file (manifest \+ instruction stream)
 
 Example assembly language program (sketch):
@@ -322,8 +322,8 @@ LOAD      r12, delay-params/1
 LOAD_I    r12, 42.333f
 LOAD_K.4  r16, events0/pitch, kstate/0
 filter1: // a label
-SVF.4     r2, r1, svf-params/3, svf-states/3
-DELAY     r4, r3, delay-params/0, delay-states/0
+SAW.4     r1, r16, svf-states/2
+SVF.4     r2, r1, r16, r3, svf-states/3
 CMP r5, r6
 BNE filter1
 HALT
@@ -366,12 +366,13 @@ After that: stateful operator state layouts (SAW, SVF), bank inner loops, time i
 - **Bank size is a voice count, a multiple of 4, in madronalib's vertical layout**: N voices occupy N registers as N/4 SignalBlock4s. Elementwise operators are layout-blind. SPREAD, MIX, BANK and UNBANK move between layouts; control-rate operators write banks directly and broadcast one-float rows.  
 - **One event channel per bank**: multitimbral programs run one bank per channel. MPE per-note controls arrive as voice rows already.  
 - **madronalib owns ControlBlock, mlvm owns the arena mapping**: madronalib exports plain data with a documented layout and never learns about arenas. The boundary is one memcpy per block.  
-- **Opcodes declared once**: an X-macro list generates the enum and the mnemonic table, so the assembler can never fall out of sync with the VM.
+- **Opcodes declared once**: an X-macro list generates the enum and the mnemonic table, so the assembler can never fall out of sync with the VM.  
+- **Operand placement comes from the instruction table, not from text order**: each opcode names its row, and a per-row spec gives every operand's field. Added when SAW, with a single arena reference that belongs in fields 6,7, showed that a positional guess cannot serve both it and LOAD. The VM needs none of this at run time; its switch already knows its fields.
 
 
 ## Open questions / TBD
 
-- Compare and branch semantics: exact conditions (ALL, ANY, threshold?), flag register count. CMP has sources but no dest, so the assembler's generic register placement currently puts src1 in field 1 rather than field 2. Resolve together with the semantics, either by giving CMP a dest (flag in a register) or by extending the per-opcode flags column in the opcode list (which now exists for "keeps state") with operand placement.  
+- Compare and branch semantics: exact conditions (ALL, ANY, threshold?), flag register count. (CMP's operands now follow the table: src1 in field 2, src2 in field 4.)  
 - When to turn off a-rate event signal generation in EventsToSignals once mlvm no longer reads it  
 - madronalib's per-block `Params` interpolation inside processors spans the block; it should become 16 frames to match LOAD\_K and keep sounds block-size independent  
 - Fused broadcast variants of ADD/MUL (bank × horizontal without SPREAD) only if profiles show SPREAD's extra registers matter  

@@ -24,6 +24,41 @@ struct LabelRef { std::string name; };
 
 using Operand = std::variant<RegisterRef, ArenaRef, FloatImm, ByteImm, LabelRef>;
 
+OperandKind kindOf(const Operand& o) {
+  if (std::get_if<RegisterRef>(&o)) return OperandKind::kReg;
+  if (std::get_if<ArenaRef>(&o)) return OperandKind::kArena;
+  if (std::get_if<FloatImm>(&o)) return OperandKind::kFloat;
+  if (std::get_if<ByteImm>(&o)) return OperandKind::kByte;
+  return OperandKind::kLabel;
+}
+
+std::string_view kindName(OperandKind k) {
+  switch (k) {
+    case OperandKind::kReg: return "a register (r0..r255)";
+    case OperandKind::kArena: return "an arena reference (name/chunk)";
+    case OperandKind::kFloat: return "a float immediate (e.g. 1.0f)";
+    case OperandKind::kByte: return "an integer 0..255";
+    case OperandKind::kLabel: return "a label";
+  }
+  return "?";
+}
+
+// "dest, src1, state" style description of a format, for error messages.
+std::string describe(const FormatSpec& spec) {
+  std::string s;
+  for (size_t i = 0; i < spec.count; ++i) {
+    if (i) s += ", ";
+    switch (spec.slots[i].kind) {
+      case OperandKind::kReg: s += "r"; break;
+      case OperandKind::kArena: s += "arena/chunk"; break;
+      case OperandKind::kFloat: s += "float"; break;
+      case OperandKind::kByte: s += "element"; break;
+      case OperandKind::kLabel: s += "label"; break;
+    }
+  }
+  return s.empty() ? "no operands" : s;
+}
+
 // a branch whose target label is resolved after all instructions are seen.
 struct Fixup {
   size_t instructionIdx;
@@ -194,6 +229,8 @@ private:
   }
 
   // MNEMONIC[.bank] operand, operand, ...
+  // Operands are placed by the opcode's format (the instruction table row), never
+  // by their position among other kinds.
   void parseInstruction(const std::vector<std::string_view>& tokens) {
     std::string_view mnemonic = tokens[0];
     std::string_view bankText;
@@ -203,11 +240,13 @@ private:
       mnemonic = mnemonic.substr(0, dot);
     }
 
-    auto op = opcodeFromName(toUpper(mnemonic));
+    const std::string name = toUpper(mnemonic);
+    auto op = opcodeFromName(name);
     if (!op) {
       error("unknown instruction '" + std::string(mnemonic) + "'");
       return;
     }
+    const FormatSpec spec = formatSpec(opcodeFormat(*op));
 
     unsigned bank = 0;
     if (!bankText.empty() && (!parseUInt(bankText, bank) || bank > 255)) {
@@ -218,10 +257,10 @@ private:
       error("bank size must be 0 or a multiple of 4, got " + std::to_string(bank));
       return;
     }
-
-    Instruction inst{};
-    inst[0] = *op;
-    inst[3] = static_cast<uint8_t>(bank);
+    if (bank && !spec.hasBank) {
+      error(name + " does not take a bank size");
+      return;
+    }
 
     std::vector<Operand> operands;
     bool operandsOk = true;
@@ -232,12 +271,52 @@ private:
     }
     if (!operandsOk) return;
 
-    if (!encode(inst, operands, opcodeHasState(*op))) return;
+    if (operands.size() != spec.count) {
+      error(name + " takes " + describe(spec) + " (" + std::to_string(spec.count) + " operands), got " +
+            std::to_string(operands.size()));
+      return;
+    }
+
+    Instruction inst{};
+    inst[0] = *op;
+    inst[3] = static_cast<uint8_t>(bank);
+    uint8_t registerFields = 0;
+
+    for (size_t i = 0; i < spec.count; ++i) {
+      const OperandSlot& slot = spec.slots[i];
+      const Operand& operand = operands[i];
+      if (kindOf(operand) != slot.kind) {
+        error("operand " + std::to_string(i + 1) + " of " + name + " must be " + std::string(kindName(slot.kind)) +
+              " (" + name + " takes " + describe(spec) + ")");
+        return;
+      }
+      switch (slot.kind) {
+        case OperandKind::kReg:
+          inst[slot.field] = std::get<RegisterRef>(operand).idx;
+          registerFields |= static_cast<uint8_t>(1 << slot.field);
+          break;
+        case OperandKind::kArena: {
+          const auto& a = std::get<ArenaRef>(operand);
+          inst[slot.field] = a.arena;
+          inst[slot.field + 1] = a.chunk;
+          break;
+        }
+        case OperandKind::kFloat:
+          setFloatImmediate(inst, std::get<FloatImm>(operand).value);
+          break;
+        case OperandKind::kByte:
+          inst[slot.field] = std::get<ByteImm>(operand).value;
+          break;
+        case OperandKind::kLabel:
+          fixups_.push_back({result_.program.instructions.size(), std::get<LabelRef>(operand).name, line_});
+          break;
+      }
+    }
 
     // a bank of N voices occupies N registers from each register operand.
     if (bank) {
-      for (uint8_t field : {uint8_t(1), uint8_t(2), uint8_t(4), uint8_t(5)}) {
-        if ((registerFields_ & (1 << field)) && (inst[field] + bank > MLVM::kNumRegisters)) {
+      for (uint8_t field = 1; field < 8; ++field) {
+        if ((registerFields & (1 << field)) && (inst[field] + bank > MLVM::kNumRegisters)) {
           error("bank of " + std::to_string(bank) + " voices at r" + std::to_string(inst[field]) +
                 " does not fit in the register file");
           return;
@@ -307,78 +386,6 @@ private:
 
     error("bad operand '" + std::string(tok) + "'");
     return std::nullopt;
-  }
-
-  // bitmask of the fields that hold register indices in the instruction most recently encoded.
-  uint8_t registerFields_{0};
-
-  // Place operands into fields by kind. Returns false and reports an error if
-  // two operands claim the same field. For a stateful opcode the last arena
-  // reference is its state and always goes to fields 6,7.
-  bool encode(Instruction& inst, const std::vector<Operand>& operands, bool hasState) {
-    static constexpr uint8_t kRegisterSlots[] = {1, 2, 4, 5};
-    static constexpr uint8_t kArenaSlots[][2] = {{4, 5}, {6, 7}};
-    size_t nextRegister = 0;
-    uint8_t used = 0;   // bitmask of fields written
-    registerFields_ = 0;
-
-    size_t nArenaRefs = 0;
-    for (const auto& operand : operands) if (std::get_if<ArenaRef>(&operand)) ++nArenaRefs;
-    size_t arenaRefsSeen = 0;
-    if (hasState && nArenaRefs == 0) {
-      error("this instruction keeps state and needs a state chunk, e.g. kstate/0");
-      return false;
-    }
-
-    auto claim = [&](uint8_t field) {
-      if (used & (1 << field)) {
-        error("too many operands: field " + std::to_string(field) + " is already in use");
-        return false;
-      }
-      used |= (1 << field);
-      return true;
-    };
-
-    for (const auto& operand : operands) {
-      if (auto* r = std::get_if<RegisterRef>(&operand)) {
-        if (nextRegister >= 4) { error("too many register operands"); return false; }
-        uint8_t field = kRegisterSlots[nextRegister++];
-        if (!claim(field)) return false;
-        inst[field] = r->idx;
-        registerFields_ |= (1 << field);
-      } else if (auto* a = std::get_if<ArenaRef>(&operand)) {
-        // the state ref of a stateful op goes to fields 6,7. Any other arena ref takes
-        // the first field pair that is still free (fields 4,5 unless registers hold
-        // them, as in SVF: in, cutoff, k).
-        ++arenaRefsSeen;
-        const bool isState = hasState && (arenaRefsSeen == nArenaRefs);
-        int pair = -1;
-        if (isState) {
-          pair = 1;
-        } else {
-          const int lastPair = hasState ? 0 : 1;   // pair 1 is reserved for the state
-          for (int p = 0; p <= lastPair && pair < 0; ++p) {
-            const auto& slots = kArenaSlots[p];
-            if (!(used & (1 << slots[0])) && !(used & (1 << slots[1]))) pair = p;
-          }
-        }
-        if (pair < 0) { error("too many operands: no field pair is free for an arena reference"); return false; }
-        const auto& slots = kArenaSlots[pair];
-        if (!claim(slots[0]) || !claim(slots[1])) return false;
-        inst[slots[0]] = a->arena;
-        inst[slots[1]] = a->chunk;
-      } else if (auto* f = std::get_if<FloatImm>(&operand)) {
-        for (uint8_t field = 4; field <= 7; ++field) if (!claim(field)) return false;
-        setFloatImmediate(inst, f->value);
-      } else if (auto* b = std::get_if<ByteImm>(&operand)) {
-        if (!claim(5)) return false;
-        inst[5] = b->value;
-      } else if (auto* l = std::get_if<LabelRef>(&operand)) {
-        if (!claim(6) || !claim(7)) return false;
-        fixups_.push_back({result_.program.instructions.size(), l->name, line_});
-      }
-    }
-    return true;
   }
 
   void resolveFixups() {

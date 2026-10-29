@@ -13,11 +13,13 @@
 //   BNE loop                    // label -> signed 16-bit pc offset
 //   HALT
 //
-// Operand kind is determined by its text, and kind determines its field in the
-// instruction word: registers fill fields 1, 2, 4, 5 in order of appearance;
-// arena refs (name/chunk) fill fields 4,5 then 6,7; a float immediate fills 4-7;
-// a bare integer fills field 5; a label fills 6,7. Comments start with // or ;.
-// Mnemonics and register names are case-insensitive.
+// Operand kind is determined by its text: rN is a register, name/chunk an arena
+// reference, 1.0f a float immediate, a bare integer an element number, anything
+// else a label. Where an operand lands in the instruction word is decided by the
+// opcode's format, its row in the instruction table (see OpFormat and formatSpec
+// in mlvm.h), never by its position among other kinds. Operand count and kinds
+// are checked against the format. Comments start with // or ;. Mnemonics and
+// register names are case-insensitive.
 
 #pragma once
 

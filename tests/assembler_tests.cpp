@@ -74,8 +74,8 @@ void testSketchProgram() {
     LOAD     r12, delay-params/1
     LOAD_I   r12, 42.333f
     filter1:  ; a label
-    SVF.4    r2, r1, svf-params/3, svf-states/3
-    saw.16   r4, r3, delay-params/0, delay-states/0
+    SVF.4    r2, r1, r3, r4, svf-states/3
+    saw.16   r4, r3, delay-states/0
     CMP      r5, r6
     BNE      filter1
     HALT
@@ -101,14 +101,14 @@ void testSketchProgram() {
   CHECK_EQ(code[1][1], 12);
   CHECK(getFloatImmediate(code[1]) == 42.333f);
 
-  // SVF.4 r2, r1, svf-params/3, svf-states/3
-  CHECK((code[2] == Instruction{SVF, 2, 1, 4, 0, 3, 1, 3}));
+  // SVF.4 r2, r1, r3, r4, svf-states/3 -> registers in 1, 2, 4, 5; state in 6,7
+  CHECK((code[2] == Instruction{SVF, 2, 1, 4, 3, 4, 1, 3}));
 
-  // lower-case mnemonic, bank 16
-  CHECK((code[3] == Instruction{SAW, 4, 3, 16, 2, 0, 3, 0}));
+  // lower-case mnemonic, bank 16; a generator's state is in 6,7
+  CHECK((code[3] == Instruction{SAW, 4, 3, 16, 0, 0, 3, 0}));
 
-  // CMP r5, r6 -> fields 1 and 2 under the generic rule
-  CHECK((code[4] == Instruction{CMP, 5, 6, 0, 0, 0, 0, 0}));
+  // CMP r5, r6 -> src1 in field 2, src2 in field 4, as the table says
+  CHECK((code[4] == Instruction{CMP, 0, 5, 0, 6, 0, 0, 0}));
 
   // BNE filter1: label is at instruction 2; branch is instruction 5; offset = 2 - 6 = -4
   CHECK_EQ(code[5][0], BNE);
@@ -392,6 +392,57 @@ void testControlRate() {
 }
 
 // ---- banks
+
+// Every opcode: build one instruction from its format spec and check each field
+// lands where the spec says. This pins the assembler to the instruction table.
+void testFormats() {
+  using namespace mlvm;
+  for (size_t o = 0; o < NUM_OPCODES; ++o) {
+    const auto op = static_cast<Opcode>(o);
+    const FormatSpec spec = formatSpec(opcodeFormat(op));
+
+    std::string text = "ARENA a 16\nlbl:\n" + std::string(opcodeName(op));
+    for (size_t i = 0; i < spec.count; ++i) {
+      text += (i ? ", " : " ");
+      switch (spec.slots[i].kind) {
+        case OperandKind::kReg: text += "r" + std::to_string(10 + i); break;
+        case OperandKind::kArena: text += "a/" + std::to_string(20 + i); break;
+        case OperandKind::kFloat: text += "1.5f"; break;
+        case OperandKind::kByte: text += "7"; break;
+        case OperandKind::kLabel: text += "lbl"; break;
+      }
+    }
+    text += "\n";
+    auto r = assemble(text);
+    if (!r.ok()) { ++failures; std::printf("FAIL: %s did not assemble\n", std::string(opcodeName(op)).c_str()); printErrors(r); continue; }
+    const Instruction& inst = r.program.instructions[0];
+
+    Instruction expected{};
+    expected[0] = op;
+    for (size_t i = 0; i < spec.count; ++i) {
+      const OperandSlot& s = spec.slots[i];
+      switch (s.kind) {
+        case OperandKind::kReg: expected[s.field] = static_cast<uint8_t>(10 + i); break;
+        case OperandKind::kArena: expected[s.field] = 0; expected[s.field + 1] = static_cast<uint8_t>(20 + i); break;
+        case OperandKind::kFloat: setFloatImmediate(expected, 1.5f); break;
+        case OperandKind::kByte: expected[s.field] = 7; break;
+        case OperandKind::kLabel: setAddressOffset(expected, -1); break;   // label at 0, branch at 0
+      }
+    }
+    if (inst != expected) {
+      ++failures;
+      std::printf("FAIL: %s encoded as", std::string(opcodeName(op)).c_str());
+      for (auto b : inst) std::printf(" %u", b);
+      std::printf(" expected");
+      for (auto b : expected) std::printf(" %u", b);
+      std::printf("\n");
+    }
+
+    // a bank suffix is accepted only where the row has a bank field
+    auto banked = assemble("ARENA a 16\nlbl:\n" + std::string(opcodeName(op)) + ".4" + text.substr(text.find(opcodeName(op)) + opcodeName(op).size()));
+    CHECK(banked.ok() == spec.hasBank);
+  }
+}
 
 void testBankErrors() {
   using namespace mlvm;
@@ -793,6 +844,7 @@ int main() {
   testExternArenas();
   testControllers();
   testControlRate();
+  testFormats();
   testBankErrors();
   testBankLayout();
   testElementwiseBank();
