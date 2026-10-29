@@ -26,32 +26,7 @@ void processAudio(AudioContext* context, MLVM* vm)
   vm->processBlock(context);
 }
 
-// Logs from a separate thread so nothing prints on the audio thread.
-struct Logger
-{
-  Logger(AudioTask* t, AudioContext* c, MLVM* v) : task(t), context(c), vm(v)
-  {
-    logThread = std::thread([&]() {
-      while (!task->hasQuit())
-      {
-        float peak = 0.f;
-        for (size_t i = 0; i < kFramesPerBlock; ++i) peak = std::max(peak, std::fabs(context->outputs[0][i]));
-        std::cout << "voice 0 gate: " << vm->registers[16][0]
-                  << "  mod wheel: " << context->getInputControllerValues(0)[1]
-                  << "  output peak: " << peak << "\n";
-        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-      }
-    });
-  }
-  ~Logger() { logThread.join(); }
-
-  AudioTask* task;
-  AudioContext* context;
-  MLVM* vm;
-  std::thread logThread;
-};
-
-int main(int argc, char* argv[])
+int main(int, char*[])
 {
   // start the Timers. call this once in an application.
   bool deferToMainThread = false;
@@ -119,8 +94,17 @@ int main(int argc, char* argv[])
   }
 
   AudioTask synthTask(&ctx, processAudio, &vm);
-  Logger log(&synthTask, &ctx, &vm);
   ctx.updateTime(0, 120.0, true);
+
+  // log once a second from the Timers thread, never from the audio thread.
+  Timer logTimer;
+  logTimer.start([&]() {
+    float peak = 0.f;
+    for (size_t i = 0; i < kFramesPerBlock; ++i) peak = std::max(peak, std::fabs(ctx.outputs[0][i]));
+    std::cout << "voice 0 gate: " << vm.registers[16][0]
+              << "  mod wheel: " << ctx.getInputControllerValues(0)[1]
+              << "  output peak: " << peak << "\n";
+  }, milliseconds(1000));
 
   return synthTask.runConsoleApp();
 }

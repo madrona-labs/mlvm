@@ -58,30 +58,6 @@ void processAudio(AudioContext* context, MLVM* vm)
   vm->processBlock(context);
 }
 
-// Logs from a separate thread so nothing prints on the audio thread.
-struct Logger
-{
-  Logger(AudioTask* t, AudioContext* c, MLVM* v) : task(t), context(c), vm(v)
-  {
-    logThread = std::thread([&]() {
-      while (!task->hasQuit())
-      {
-        float peak = 0.f;
-        for (size_t i = 0; i < kFramesPerBlock; ++i) peak = std::max(peak, std::fabs(context->outputs[0][i]));
-        // r64 is the gain bank; its first float is voice 0's gain at frame 0.
-        std::cout << "output peak: " << peak << "  voice 0 gain: " << vm->registers[64][0] << "\n";
-        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-      }
-    });
-  }
-  ~Logger() { logThread.join(); }
-
-  AudioTask* task;
-  AudioContext* context;
-  MLVM* vm;
-  std::thread logThread;
-};
-
 int main(int, char*[])
 {
   // start the Timers. call this once in an application.
@@ -104,8 +80,16 @@ int main(int, char*[])
 
   AudioContext ctx(kInputChannels, kOutputChannels);
   AudioTask exampleTask(&ctx, processAudio, &vm);
-  Logger log(&exampleTask, &ctx, &vm);
   ctx.updateTime(0, 120.0, true);
+
+  // log once a second from the Timers thread, never from the audio thread.
+  // r64 is the gain bank; its first float is voice 0's gain at frame 0.
+  Timer logTimer;
+  logTimer.start([&]() {
+    float peak = 0.f;
+    for (size_t i = 0; i < kFramesPerBlock; ++i) peak = std::max(peak, std::fabs(ctx.outputs[0][i]));
+    std::cout << "output peak: " << peak << "  voice 0 gain: " << vm.registers[64][0] << "\n";
+  }, milliseconds(1000));
 
   return exampleTask.runConsoleApp();
 }
