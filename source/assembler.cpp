@@ -223,18 +223,20 @@ private:
       error("DATA cannot initialize an external arena ('" + desc.name + "')");
       return;
     }
+    // DATA values are plain numbers: any form strtof accepts, with or without a
+    // point, sign or exponent, plus an optional 'f' suffix.
     DataInit init{ref->arena, ref->chunk, {}};
     for (size_t i = 2; i < tokens.size(); ++i) {
-      float f = 0.f;
-      unsigned u = 0;
-      if (parseFloatLiteral(tokens[i], f)) {
-        init.values.push_back(f);
-      } else if (parseUInt(tokens[i], u)) {
-        init.values.push_back(static_cast<float>(u));
-      } else {
+      std::string_view tok = tokens[i];
+      if (!tok.empty() && (tok.back() == 'f' || tok.back() == 'F')) tok.remove_suffix(1);
+      std::string body(tok);
+      char* end = nullptr;
+      const float f = body.empty() ? 0.f : std::strtof(body.c_str(), &end);
+      if (body.empty() || end != body.c_str() + body.size()) {
         error("bad DATA value '" + std::string(tokens[i]) + "'");
         return;
       }
+      init.values.push_back(f);
     }
     if (init.values.size() > desc.chunkSizeInFloats) {
       error("DATA has " + std::to_string(init.values.size()) + " values but a chunk of '" + desc.name +

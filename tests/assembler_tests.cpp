@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -622,17 +623,19 @@ int countWraps(const std::vector<float>& s) {
 
 void testData() {
   using namespace mlvm;
+  // values in every spelling a number can take: with or without a point, negative
+  // integers (as an ostream prints an exact float), exponents, and an f suffix
   auto r = assemble(R"(
     ARENA  consts 4
     EXTERN ctl0 1
-    DATA   consts/2 1.5f 2 -3.25
-    DATA   consts/0 7
+    DATA   consts/2 1.5f 2 -3.25 -2
+    DATA   consts/0 7 1e-3
     HALT
   )");
   if (!r.ok()) printErrors(r);
   CHECK(r.ok());
   CHECK_EQ(r.program.data.size(), 2u);
-  CHECK(disassemble(r.program).find("DATA consts/2 1.5 2 -3.25") != std::string::npos);
+  CHECK(disassemble(r.program).find("DATA consts/2 1.5 2 -3.25 -2") != std::string::npos);
 
   MLVM vm;
   CHECK(vm.loadProgram(r.program));
@@ -640,8 +643,11 @@ void testData() {
   CHECK(consts[2 * 4 + 0] == 1.5f);
   CHECK(consts[2 * 4 + 1] == 2.f);
   CHECK(consts[2 * 4 + 2] == -3.25f);
-  CHECK(consts[2 * 4 + 3] == 0.f);     // unwritten rest of the chunk stays zero
+  CHECK(consts[2 * 4 + 3] == -2.f);
   CHECK(consts[0] == 7.f);
+  CHECK(consts[1] == 1e-3f);
+  CHECK(consts[2] == 0.f);             // unwritten rest of the chunk stays zero
+  CHECK(!assemble("ARENA a 4\nDATA a/0 1.0 x\n").ok());
 
   // errors: external arena, too many values, undeclared arena, no values
   for (const char* bad : {"ARENA a 4\nEXTERN ctl0 1\nDATA ctl0/0 1.0\n",
@@ -708,11 +714,15 @@ void testSine() {
 std::string example0Program() {
   const std::array<float, 16> voiceHz = {110.00f, 123.47f, 138.59f, 164.81f, 185.00f, 220.00f, 246.94f, 277.18f,
                                          329.63f, 369.99f, 440.00f, 493.88f, 554.37f, 659.26f, 739.99f, 880.00f};
-  std::string data0 = "DATA consts/0", data1 = "DATA consts/1";
+  // formatted with an ostream, as the example does, so exact values print as integers
+  std::ostringstream d0, d1;
+  d0 << "DATA consts/0";
+  d1 << "DATA consts/1";
   for (size_t v = 0; v < 16; ++v) {
-    data0 += " " + std::to_string(std::log2(voiceHz[v] / 440.f));
-    data1 += " " + std::to_string(std::log2((0.2f - 0.1f * v / 15.f) / 440.f));
+    d0 << " " << std::log2(voiceHz[v] / 440.f);
+    d1 << " " << std::log2((0.2f - 0.1f * v / 15.f) / 440.f);
   }
+  const std::string data0 = d0.str(), data1 = d1.str();
   return
     "EXTERN audioout " + kFramesStr + "\nARENA consts 16\nARENA kstate 16\n" + data0 + "\n" + data1 + "\n" + R"(
     LOAD_K.16  r16, consts/0, kstate/0
