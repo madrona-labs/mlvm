@@ -285,7 +285,10 @@ struct MLVM {
   //   audioin    chunk = one SignalBlock (kFramesPerBlock floats), chunk index = channel
   //   audioout   same layout, writable
   //   events<c>  event channel c's ml::VoiceControls: chunk = one ml::ControlRow (16 floats,
-  //              one per voice), chunk index = row per ml::ControlSignals
+  //              one per voice), chunk index = row per ml::ControlSignals. The pitch row
+  //              is a MIDI note number (bend already added, in semitones), as the plugin
+  //              wrappers and MIDIMessageToEvent fill it; a program converts to octaves
+  //              with (n - 69) / 12 before SAW and friends.
   //   ctl<c>     event channel c's ml::ControllerValues: chunk = one float, chunk index =
   //              controller number 0..127
   //
