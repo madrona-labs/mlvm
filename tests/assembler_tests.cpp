@@ -710,21 +710,14 @@ void testSine() {
   CHECK(h == v0);                                    // bank 0 matches lane 0
 }
 
-// Example0's program, built the same way the example builds it
+// Example0's program, as in examples/example0.cpp
 std::string example0Program() {
-  const std::array<float, 16> voiceHz = {110.00f, 123.47f, 138.59f, 164.81f, 185.00f, 220.00f, 246.94f, 277.18f,
-                                         329.63f, 369.99f, 440.00f, 493.88f, 554.37f, 659.26f, 739.99f, 880.00f};
-  // formatted with an ostream, as the example does, so exact values print as integers
-  std::ostringstream d0, d1;
-  d0 << "DATA consts/0";
-  d1 << "DATA consts/1";
-  for (size_t v = 0; v < 16; ++v) {
-    d0 << " " << std::log2(voiceHz[v] / 440.f);
-    d1 << " " << std::log2((0.2f - 0.1f * v / 15.f) / 440.f);
-  }
-  const std::string data0 = d0.str(), data1 = d1.str();
   return
-    "EXTERN audioout " + kFramesStr + "\nARENA consts 16\nARENA kstate 16\n" + data0 + "\n" + data1 + "\n" + R"(
+    "EXTERN audioout " + kFramesStr + "\n" + R"(
+    ARENA  consts 16
+    ARENA  kstate 16
+    DATA   consts/0 -2 -1.8333 -1.6667 -1.4167 -1.25 -1 -0.8333 -0.6667 -0.4167 -0.25 0 0.1667 0.3333 0.5833 0.75 1
+    DATA   consts/1 -11.103 -11.152 -11.203 -11.255 -11.310 -11.366 -11.425 -11.487 -11.550 -11.618 -11.689 -11.762 -11.840 -11.923 -12.010 -12.103
     LOAD_K.16  r16, consts/0, kstate/0
     LOAD_K.16  r32, consts/1, kstate/1
     SINE.16    r48, r16, kstate/2
