@@ -21,13 +21,9 @@ constexpr int kInputChannels = 0;
 constexpr int kOutputChannels = 2;
 constexpr int kVoices = 16;
 
-struct SynthState {
-  MLVM* vm{nullptr};
-};
-
-void processAudio(AudioContext* context, SynthState* state)
+void processAudio(AudioContext* context, MLVM* vm)
 {
-  state->vm->processBlock(context);
+  vm->processBlock(context);
 }
 
 // Logs from a separate thread so nothing prints on the audio thread.
@@ -122,8 +118,7 @@ int main(int argc, char* argv[])
     return 1;
   }
 
-  SynthState state{&vm};
-  AudioTask synthTask(&ctx, processAudio, &state);
+  AudioTask synthTask(&ctx, processAudio, &vm);
   Logger log(&synthTask, &ctx, &vm);
   ctx.updateTime(0, 120.0, true);
 
